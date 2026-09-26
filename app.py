@@ -214,16 +214,25 @@ def decode_mime(value):
     return "".join(chunks)
 
 
-LABELED_CODE = re.compile(
-    r"(?i)(?:verification code|verify code|one[- ]time code|one[- ]time|код|code|pin|otp|пароль|passcode|password|verification|verify|confirm(?:ation)?)"
-    r"[^0-9]{0,40}(\d{4,8})"
+CODE_LABEL = re.compile(
+    r"(?i)(?<![A-Za-zА-Яа-яЁё])"
+    r"(?<!zip )(?<!postal )(?<!error )(?<!status )(?<!country )(?<!area )(?<!bar )"
+    r"(?:verification code|security code|login code|sign[- ]in code|"
+    r"one[- ]time password|one[- ]time code|one[- ]time pin|"
+    r"passcode|otp|pin|код подтверждения|одноразовый код|пароль|password|код|code)"
+    r"(?![A-Za-zА-Яа-яЁё])"
 )
-DIGIT_CODE = re.compile(r"(?<!\d)(\d{4,8})(?!\d)")
-MIXED_CODE = re.compile(
-    r"(?<![A-Za-z0-9])(?=[A-Za-z0-9]*[A-Za-z])(?=[A-Za-z0-9]*\d)[A-Za-z0-9]{4,8}(?![A-Za-z0-9])"
+CODE_FILLER = re.compile(
+    r"(?i)^(?:[\s:.=#*›>«»\"'()\[\]\-–—/]|is\b|ваш\b|your\b|the\b|this\b|below\b|ниже\b|"
+    r"follows\b|следующий\b|подтверждения\b|подтверждение\b|code\b|код\b)+"
 )
-SPACED_CODE = re.compile(r"(?<!\d)(\d{2,4}(?:[ \u00a0]\d{2,4}){1,3})(?!\d)")
-PREFIX_CODE = re.compile(r"(?<![A-Za-z0-9])([A-Za-z]-?\d{3,6})(?!\d)")
+CODE_TOKEN = re.compile(
+    r"(?i)^([A-Za-z]-\d{3,6}|\d{2,4}(?:[ \u00a0]\d{2,4}){1,2}(?!\d)|[A-Za-z0-9]{4,8})"
+)
+CODE_BEFORE = re.compile(
+    r"(?i)([A-Za-z]-\d{3,6}|\d{4,8}|[A-Za-z0-9]*\d[A-Za-z0-9]*)"
+    r"(?:\s+(?:is|ваш|your|the|this)){0,3}\s*$"
+)
 
 
 def part_text(part):
@@ -292,18 +301,34 @@ def add_code(found, seen, raw):
     found.append(code)
 
 
+def token_after_label(text, end):
+    window = CODE_FILLER.sub("", text[end : end + 48])
+    match = CODE_TOKEN.match(window)
+    if not match:
+        return ""
+    if re.match(r"[ \u00a0]\d", window[match.end() :]):
+        return ""
+    return match.group(1)
+
+
+def token_before_label(text, start):
+    window = text[max(0, start - 32) : start]
+    match = CODE_BEFORE.search(window)
+    if not match:
+        return ""
+    return match.group(1)
+
+
 def extract_codes(*chunks):
     text = "\n".join(chunk for chunk in chunks if chunk)
     found = []
     seen = set()
-    for pattern in (LABELED_CODE, SPACED_CODE, PREFIX_CODE, DIGIT_CODE, MIXED_CODE):
-        for match in pattern.finditer(text):
-            value = match.group(1) if match.lastindex else match.group(0)
-            if pattern is MIXED_CODE and value.islower():
-                continue
+    for match in CODE_LABEL.finditer(text):
+        value = token_after_label(text, match.end()) or token_before_label(text, match.start())
+        if value:
             add_code(found, seen, value)
-            if len(found) >= 6:
-                return found
+        if len(found) >= 4:
+            break
     return found
 
 
