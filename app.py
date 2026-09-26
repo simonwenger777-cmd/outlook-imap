@@ -217,22 +217,18 @@ def decode_mime(value):
 CODE_LABEL = re.compile(
     r"(?i)(?<![A-Za-zА-Яа-яЁё])"
     r"(?<!zip )(?<!postal )(?<!error )(?<!status )(?<!country )(?<!area )(?<!bar )"
-    r"(?:verification code|security code|login code|sign[- ]in code|"
-    r"one[- ]time password|one[- ]time code|one[- ]time pin|"
-    r"passcode|otp|pin|код подтверждения|одноразовый код|пароль|password|код|code)"
+    r"(?:verification code|security code|login code|confirmation code|authentication code|"
+    r"sign[- ]in code|one[- ]time password|one[- ]time code|one[- ]time pin|"
+    r"passcode|otp|pin|код подтверждения|одноразовый код|код безопасности|код доступа|"
+    r"проверочный код|пароль|password|код(?:а|у|ом|е)?|code)"
     r"(?![A-Za-zА-Яа-яЁё])"
 )
-CODE_FILLER = re.compile(
-    r"(?i)^(?:[\s:.=#*›>«»\"'()\[\]\-–—/]|is\b|ваш\b|your\b|the\b|this\b|below\b|ниже\b|"
-    r"follows\b|следующий\b|подтверждения\b|подтверждение\b|code\b|код\b)+"
+CODE_NEAR = re.compile(
+    r"(?<!\d)(\d{4,8})(?!\d)"
+    r"|(?<![A-Za-z0-9])([A-Za-z]-\d{3,6})(?!\d)"
+    r"|(?<![A-Za-z0-9])((?=[A-Za-z0-9]*[A-Za-z])(?=[A-Za-z0-9]*\d)[A-Za-z0-9]{5,8})(?![A-Za-z0-9])"
 )
-CODE_TOKEN = re.compile(
-    r"(?i)^([A-Za-z]-\d{3,6}|\d{2,4}(?:[ \u00a0]\d{2,4}){1,2}(?!\d)|[A-Za-z0-9]{4,8})"
-)
-CODE_BEFORE = re.compile(
-    r"(?i)([A-Za-z]-\d{3,6}|\d{4,8}|[A-Za-z0-9]*\d[A-Za-z0-9]*)"
-    r"(?:\s+(?:is|ваш|your|the|this)){0,3}\s*$"
-)
+CODE_SPACED = re.compile(r"(?<!\d)(\d{2,4}(?:[ \u00a0]\d{2,4}){1,2})")
 
 
 def part_text(part):
@@ -268,8 +264,8 @@ def message_bodies(msg):
 def html_to_text(html):
     cleaned = re.sub(r"(?is)<(script|style)[^>]*>.*?</\1>", " ", html)
     cleaned = re.sub(r"(?i)<br\s*/?>", "\n", cleaned)
-    cleaned = re.sub(r"(?i)</(p|div|tr|h\d|li|table)>", "\n", cleaned)
-    cleaned = re.sub(r"(?i)</td>", " ", cleaned)
+    cleaned = re.sub(r"(?i)</(?:p|div|tr|h\d|li|table|td|th|center|blockquote)>", "\n", cleaned)
+    cleaned = re.sub(r"(?i)<(?:p|div|tr|h\d|li|td|th|center|blockquote)\b[^>]*>", "\n", cleaned)
     cleaned = re.sub(r"<[^>]+>", " ", cleaned)
     return unescape(cleaned)
 
@@ -301,35 +297,79 @@ def add_code(found, seen, raw):
     found.append(code)
 
 
-def token_after_label(text, end):
-    window = CODE_FILLER.sub("", text[end : end + 48])
-    match = CODE_TOKEN.match(window)
-    if not match:
-        return ""
-    if re.match(r"[ \u00a0]\d", window[match.end() :]):
-        return ""
-    return match.group(1)
+def code_lines(text):
+    values = []
+    for raw_line in text.splitlines():
+        line = raw_line.strip().strip("*_>#-–—[]()«»\"'")
+        if not line:
+            continue
+        spaced = CODE_SPACED.fullmatch(line)
+        if spaced:
+            values.append(spaced.group(1))
+            continue
+        if " " in line:
+            continue
+        if re.fullmatch(r"[A-Za-z]-\d{3,6}|\d{4,8}", line):
+            values.append(line)
+        elif re.fullmatch(r"(?=[A-Za-z]*\d)(?=\d*[A-Za-z])[A-Za-z0-9]{5,8}", line):
+            values.append(line)
+    return values
 
 
-def token_before_label(text, start):
-    window = text[max(0, start - 32) : start]
-    match = CODE_BEFORE.search(window)
-    if not match:
-        return ""
-    return match.group(1)
+def candidates_near(window):
+    runs = [match.span() for match in re.finditer(r"(?<!\d)(?:\d[ \u00a0]?){9,}(?!\d)", window)]
+
+    def buried(span):
+        return any(span[0] >= start and span[1] <= end for start, end in runs)
+
+    six = []
+    other = []
+    for match in CODE_NEAR.finditer(window):
+        if buried(match.span()):
+            continue
+        value = next(group for group in match.groups() if group)
+        if re.fullmatch(r"\d{6}", value):
+            six.append(value)
+        else:
+            other.append(value)
+    spaced = []
+    for match in CODE_SPACED.finditer(window):
+        if buried(match.span()) or re.match(r"[ \u00a0]\d", window[match.end() :]):
+            continue
+        spaced.append(match.group(1))
+    return six + code_lines(window) + spaced + other
+
+
+def take_code(found, seen, values):
+    before = len(found)
+    for value in values:
+        add_code(found, seen, value)
+        if len(found) > before:
+            return True
+    return False
 
 
 def extract_codes(*chunks):
     text = "\n".join(chunk for chunk in chunks if chunk)
+    text = re.sub(r"https?://\S+", " ", text)
+    text = text.replace("\u00a0", " ")
     found = []
     seen = set()
+    labeled = False
     for match in CODE_LABEL.finditer(text):
-        value = token_after_label(text, match.end()) or token_before_label(text, match.start())
-        if value:
-            add_code(found, seen, value)
-        if len(found) >= 4:
-            break
-    return found
+        labeled = True
+        window = text[match.end() : match.end() + 400]
+        before = text[max(0, match.start() - 48) : match.start()]
+        if take_code(found, seen, candidates_near(window) or candidates_near(before)):
+            if len(found) >= 3:
+                break
+    if not found:
+        take_code(found, seen, code_lines(text))
+    elif labeled:
+        for value in code_lines(text):
+            if re.fullmatch(r"\d{6}", re.sub(r"\D", "", value)):
+                add_code(found, seen, value)
+    return found[:4]
 
 
 def sanitize_html(html):
@@ -377,7 +417,7 @@ def present_message(msg):
         "date": format_date(msg.get("Date")),
         "text": plain or visible,
         "html": wrapped,
-        "codes": extract_codes(decode_mime(msg.get("Subject")), visible),
+        "codes": extract_codes(decode_mime(msg.get("Subject")), plain, visible),
     }
 
 
