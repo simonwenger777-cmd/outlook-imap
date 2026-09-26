@@ -1,12 +1,9 @@
 services:
   - type: web
     name: outlook-imap
-    runtime: python
+    runtime: docker
     plan: free
     region: frankfurt
-    buildCommand: pip install -r requirements.txt
-    startCommand: gunicorn app:app --bind 0.0.0.0:$PORT --timeout 90 --workers 1
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
     healthCheckPath: /health
-    envVars:
-      - key: PYTHON_VERSION
-        value: "3.12.8"
