@@ -571,14 +571,29 @@ def interesting_mailboxes(imap):
     return chosen
 
 
-def search_ids(imap, criteria):
+def search_ids(imap, *criteria):
     try:
-        status, data = imap.search(None, criteria)
-    except imaplib.IMAP4.error:
+        status, data = imap.search(None, *criteria)
+    except (imaplib.IMAP4.error, OSError):
         return []
     if status != "OK" or not data or not data[0]:
         return []
     return data[0].split()
+
+
+def notion_header_ids(imap, ids):
+    found = []
+    for num in ids:
+        try:
+            status, data = imap.fetch(num, "(BODY.PEEK[HEADER.FIELDS (FROM SUBJECT)])")
+        except (imaplib.IMAP4.error, OSError):
+            continue
+        if status != "OK" or not data:
+            continue
+        raw = b"".join(part[1] for part in data if isinstance(part, tuple) and part[1])
+        if b"notion" in raw.lower():
+            found.append(num)
+    return found
 
 
 def fetch_ids(imap, ids):
@@ -602,11 +617,14 @@ def read_folder(imap, mailbox, recent_limit):
         return []
     if status != "OK":
         return []
-    recent = search_ids(imap, "ALL")[-recent_limit:] if recent_limit else []
-    notion = search_ids(imap, '(OR FROM "notion" SUBJECT "notion")')[-20:]
+    all_ids = search_ids(imap, "ALL")
+    recent = all_ids[-recent_limit:] if recent_limit else []
+    notion = search_ids(imap, "FROM", "notion") + search_ids(imap, "SUBJECT", "notion")
+    if not notion:
+        notion = notion_header_ids(imap, all_ids[-80:])
     ordered = []
     seen = set()
-    for num in list(notion) + list(recent):
+    for num in list(notion[-30:]) + list(recent):
         if num not in seen:
             seen.add(num)
             ordered.append(num)
@@ -657,10 +675,16 @@ def outlook_messages(account, limit):
             imap = imaplib.IMAP4_SSL(host, 993, timeout=25)
             imap.authenticate("XOAUTH2", lambda _: auth)
             found = []
-            for mailbox in interesting_mailboxes(imap):
-                recent = limit if mailbox.lower() == "inbox" else 0
-                found.extend(read_folder(imap, mailbox, recent))
-            return dedupe_messages(found)
+            mailboxes = interesting_mailboxes(imap)
+            mailboxes.sort(key=lambda name: 0 if name.lower() == "inbox" else 1)
+            for mailbox in mailboxes[:4]:
+                try:
+                    recent = limit if mailbox.lower() == "inbox" else 0
+                    found.extend(read_folder(imap, mailbox, recent))
+                except Exception:
+                    continue
+            if found:
+                return dedupe_messages(found)
         except Exception:
             continue
         finally:
