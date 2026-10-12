@@ -6,6 +6,7 @@ import imaplib
 import os
 import re
 import time
+from datetime import timedelta, timezone
 from email.header import decode_header
 from email.utils import parseaddr, parsedate_to_datetime
 from html import unescape
@@ -522,13 +523,19 @@ def present_message(msg):
     }
 
 
+MSK = timezone(timedelta(hours=3))
+
+
 def format_date(value):
     if not value:
         return ""
     try:
-        return parsedate_to_datetime(value).strftime("%Y-%m-%d %H:%M")
-    except (TypeError, ValueError, IndexError):
+        moment = parsedate_to_datetime(value)
+    except (TypeError, ValueError, IndexError, OverflowError):
         return value
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=timezone.utc)
+    return moment.astimezone(MSK).strftime("%Y-%m-%d %H:%M") + " МСК"
 
 
 def close_imap(imap):
