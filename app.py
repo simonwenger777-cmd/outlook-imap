@@ -5,6 +5,7 @@ import email
 import imaplib
 import os
 import re
+import time
 from email.header import decode_header
 from email.utils import parseaddr, parsedate_to_datetime
 from html import unescape
@@ -20,9 +21,14 @@ FIRSTMAIL_IMAP = "imap.firstmail.ltd"
 IMAP_SCOPES = (
     "https://outlook.office.com/IMAP.AccessAsUser.All offline_access",
     "https://outlook.office365.com/IMAP.AccessAsUser.All offline_access",
+    "https://outlook.office.com/IMAP.AccessAsUser.All",
+    "https://outlook.office365.com/IMAP.AccessAsUser.All",
 )
+OUTLOOK_HOSTS = ("outlook.office365.com", "imap-mail.outlook.com")
+FATAL_TOKEN_ERRORS = {"invalid_grant", "interaction_required", "invalid_client"}
 MAX_ACCOUNTS = 5
-MAX_MESSAGES = 15
+MAX_MESSAGES = 12
+HTTP = requests.Session()
 
 PAGE = """
 <!doctype html>
@@ -30,50 +36,76 @@ PAGE = """
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Outlook IMAP</title>
+  <meta name="color-scheme" content="light">
+  <title>Почта</title>
   <style>
     :root { color-scheme: light; }
     * { box-sizing: border-box; }
-    body { margin: 0; font: 15px/1.45 "Segoe UI", system-ui, sans-serif; background: #e7edf4; color: #1c2430; }
-    main { max-width: 920px; margin: 0 auto; padding: 28px 16px 72px; }
-    h1 { font-size: 1.35rem; font-weight: 680; margin: 0 0 6px; }
-    p.note { color: #5d6b7c; margin: 0 0 16px; }
-    form.panel, section.box { background: #fff; border: 1px solid #d5deea; border-radius: 14px; padding: 16px; }
-    section.box { margin-top: 18px; }
-    label { display: block; margin: 10px 0 6px; color: #3d4b5c; }
-    textarea, input[type=number] {
-      width: 100%; border: 1px solid #c9d4e2; border-radius: 8px; background: #f8fafc;
-      color: inherit; padding: 10px 12px; font: inherit;
+    body {
+      margin: 0;
+      background: #d5d5d5;
+      color: #1a1a1a;
+      font: 15px/1.5 "Segoe UI", system-ui, sans-serif;
     }
-    textarea { min-height: 120px; font-family: ui-monospace, Consolas, monospace; font-size: 13px; }
-    .row { display: flex; gap: 14px; align-items: end; flex-wrap: wrap; margin-top: 4px; }
-    .row .grow { flex: 1; min-width: 160px; }
+    main { max-width: 760px; margin: 0 auto; padding: 40px 16px 88px; }
+    h1 { margin: 0 0 8px; font-size: 1.7rem; font-weight: 600; letter-spacing: -0.04em; }
+    p.note { margin: 0 0 18px; color: #5e5e5e; }
+    form.panel, section.box {
+      background: #f4f4f4;
+      border-radius: 32px;
+      padding: 18px;
+      box-shadow: 0 16px 40px rgba(0, 0, 0, 0.06);
+    }
+    section.box { margin-top: 16px; }
+    textarea {
+      width: 100%;
+      min-height: 140px;
+      border: 0;
+      border-radius: 24px;
+      background: #e6e6e6;
+      color: #1a1a1a;
+      padding: 16px 18px;
+      font: 13px/1.45 ui-monospace, Consolas, monospace;
+      resize: vertical;
+    }
+    textarea:focus { outline: none; background: #efefef; }
     button.submit {
-      background: #1f6feb; color: #fff; border: 0; border-radius: 8px;
-      padding: 10px 16px; font: inherit; font-weight: 650; cursor: pointer;
+      margin-top: 14px;
+      border: 0;
+      border-radius: 999px;
+      background: #1a1a1a;
+      color: #f7f7f7;
+      padding: 12px 22px;
+      font: inherit;
+      cursor: pointer;
     }
-    .err { color: #a12626; }
-    .ok { color: #17693a; margin: 0 0 8px; }
-    h2 { font-size: 1.05rem; margin: 0 0 12px; }
-    article.mail { border: 1px solid #e1e8f0; border-radius: 12px; padding: 14px 14px 10px; margin: 0 0 12px; background: #fbfcfe; }
-    .who { display: flex; gap: 8px 12px; align-items: baseline; flex-wrap: wrap; color: #5d6b7c; font-size: 0.92rem; }
-    .from { color: #1c2430; font-size: 0.98rem; }
-    .addr { color: #6b7c90; }
+    button.submit:disabled { background: #8a8a8a; cursor: default; }
+    h2 { margin: 2px 4px 4px; font-size: 1rem; font-weight: 600; }
+    p.empty { margin: 10px 6px 4px; color: #6d6d6d; }
+    article.mail { background: #fafafa; border-radius: 26px; padding: 16px 16px 12px; margin-top: 12px; }
+    .who { display: flex; gap: 8px 12px; align-items: baseline; flex-wrap: wrap; color: #6a6a6a; font-size: 0.92rem; }
+    .from { color: #161616; font-size: 1rem; }
+    .source { letter-spacing: 0.08em; text-transform: uppercase; font-size: 0.72rem; color: #8a8a8a; }
     time { margin-left: auto; white-space: nowrap; }
-    h3 { font-size: 1.05rem; font-weight: 680; margin: 6px 0 10px; }
-    .codes { display: flex; flex-wrap: wrap; gap: 8px; margin: 0 0 10px; }
+    h3 { margin: 8px 0 12px; font-size: 1.08rem; font-weight: 600; letter-spacing: -0.02em; }
+    .codes { display: flex; flex-wrap: wrap; gap: 8px; margin: 0 0 12px; }
     button.chip {
-      display: inline-flex; align-items: center; gap: 10px; border: 1px solid #b9d4ff;
-      background: #eef5ff; color: #12315c; border-radius: 999px; padding: 7px 8px 7px 14px;
+      display: inline-flex; align-items: center; gap: 10px;
+      border: 0; background: #ececec; color: #1a1a1a;
+      border-radius: 999px; padding: 7px 8px 7px 16px;
       font: inherit; cursor: pointer;
     }
-    button.chip .chip-value { font-family: ui-monospace, Consolas, monospace; font-size: 1.15rem; font-weight: 720; letter-spacing: 0.08em; }
-    button.chip .chip-action { background: #1f6feb; color: #fff; border-radius: 999px; padding: 4px 10px; font-size: 0.78rem; font-weight: 650; }
-    button.chip.copied { border-color: #8ed0aa; background: #eefaf3; }
-    button.chip.copied .chip-action { background: #17693a; }
-    details summary { cursor: pointer; color: #1f6feb; font-weight: 650; padding: 4px 0 8px; }
-    iframe.letter { width: 100%; min-height: 280px; border: 1px solid #e1e8f0; border-radius: 10px; background: #fff; }
-    pre.body { white-space: pre-wrap; word-break: break-word; margin: 0; padding: 14px; background: #fff; border: 1px solid #e1e8f0; border-radius: 10px; }
+    button.chip .chip-value { font-family: ui-monospace, Consolas, monospace; font-size: 1.15rem; font-weight: 700; letter-spacing: 0.08em; }
+    button.chip .chip-action { background: #1a1a1a; color: #f7f7f7; border-radius: 999px; padding: 5px 12px; font-size: 0.78rem; }
+    button.chip.copied { background: #1a1a1a; color: #f7f7f7; }
+    button.chip.copied .chip-action { background: #f4f4f4; color: #1a1a1a; }
+    details summary { cursor: pointer; color: #3a3a3a; font-weight: 600; padding: 4px 0 10px; list-style: none; }
+    details summary::-webkit-details-marker { display: none; }
+    iframe.letter, pre.body {
+      width: 100%; min-height: 240px; border: 0; border-radius: 22px; background: #fff;
+      filter: grayscale(1);
+    }
+    pre.body { white-space: pre-wrap; word-break: break-word; margin: 0; padding: 16px; min-height: 0; }
     @media (max-width: 640px) {
       time { margin-left: 0; }
       button.chip { width: 100%; justify-content: space-between; }
@@ -82,26 +114,19 @@ PAGE = """
 </head>
 <body>
 <main>
-  <h1>Outlook IMAP</h1>
-  <p class="note">Строка аккаунта: email:password:recovery email:recovery password:refresh token:client id. Одна строка — один ящик. Данные нигде не сохраняются. Код до 8 символов копируется кнопкой, письмо раскрывать не нужно.</p>
-  <form class="panel" method="post">
-    <label for="accounts">Аккаунты</label>
-    <textarea id="accounts" name="accounts" required>{{ accounts }}</textarea>
-    <div class="row">
-      <div class="grow">
-        <label for="limit">Писем из каждого ящика</label>
-        <input id="limit" name="limit" type="number" min="1" max="{{ max_messages }}" value="{{ limit }}">
-      </div>
-      <label><input type="checkbox" name="recovery" value="1" {% if recovery %}checked{% endif %}> ещё recovery через imap.firstmail.ltd:993</label>
-      <button class="submit" type="submit">Открыть почту</button>
-    </div>
+  <h1>Почта</h1>
+  <p class="note">Одна строка на ящик: email:password:recovery email:recovery password:refresh token:client id. Outlook и recovery открываются сами. Код копируется кнопкой.</p>
+  <form class="panel" method="post" id="mail-form">
+    <textarea id="accounts" name="accounts" placeholder="вставьте строки аккаунтов" required>{{ accounts }}</textarea>
+    <button class="submit" type="submit">Открыть</button>
   </form>
   {% macro letters(items) %}
     {% for msg in items %}
     <article class="mail">
       <div class="who">
         <strong class="from">{{ msg.from_name or msg.from_addr or msg.from }}</strong>
-        {% if msg.from_name and msg.from_addr %}<span class="addr">{{ msg.from_addr }}</span>{% endif %}
+        {% if msg.from_name and msg.from_addr %}<span>{{ msg.from_addr }}</span>{% endif %}
+        <span class="source">{{ msg.source }}</span>
         <time>{{ msg.date }}</time>
       </div>
       <h3>{{ msg.subject }}</h3>
@@ -115,8 +140,8 @@ PAGE = """
         {% endfor %}
       </div>
       {% endif %}
-      <details>
-        <summary>Открыть письмо</summary>
+      <details {% if msg.codes %}open{% endif %}>
+        <summary>{% if msg.codes %}Письмо{% else %}Открыть письмо{% endif %}</summary>
         {% if msg.html %}
         <iframe class="letter" sandbox="allow-same-origin allow-popups allow-popups-to-escape-sandbox" srcdoc="{{ msg.html }}" onload="fitFrame(this)"></iframe>
         {% else %}
@@ -129,12 +154,10 @@ PAGE = """
   {% for block in results %}
   <section class="box">
     <h2>{{ block.email }}</h2>
-    {% if block.error %}<p class="err">{{ block.error }}</p>{% else %}<p class="ok">Outlook: {{ block.messages|length }} писем</p>{% endif %}
-    {{ letters(block.messages) }}
-    {% if block.recovery_error %}<p class="err">Recovery: {{ block.recovery_error }}</p>{% endif %}
-    {% if block.recovery is not none %}
-      <p class="ok">Recovery {{ block.recovery_email }}: {{ block.recovery|length }} писем</p>
-      {{ letters(block.recovery) }}
+    {% if block.messages %}
+      {{ letters(block.messages) }}
+    {% else %}
+      <p class="empty">Писем нет</p>
     {% endif %}
   </section>
   {% endfor %}
@@ -144,8 +167,8 @@ function fitFrame(frame) {
   try {
     const doc = frame.contentDocument;
     if (!doc) return;
-    const height = Math.max(doc.documentElement.scrollHeight, doc.body ? doc.body.scrollHeight : 0, 240);
-    frame.style.height = (height + 24) + "px";
+    const height = Math.max(doc.documentElement.scrollHeight, doc.body ? doc.body.scrollHeight : 0, 220);
+    frame.style.height = (height + 28) + "px";
   } catch (err) {}
 }
 async function copyCode(btn) {
@@ -168,6 +191,11 @@ async function copyCode(btn) {
     action.textContent = "копировать";
   }, 1400);
 }
+document.getElementById("mail-form").addEventListener("submit", function () {
+  const button = this.querySelector("button");
+  button.disabled = true;
+  button.textContent = "Открываем";
+});
 </script>
 </body>
 </html>
@@ -406,7 +434,7 @@ def present_message(msg):
             "<base target='_blank'>"
             "<style>body{margin:0;padding:16px;font:15px/1.5 Segoe UI,system-ui,sans-serif;"
             "color:#1c2430;background:#fff;overflow-wrap:anywhere}"
-            "img{max-width:100%;height:auto} a{color:#1f6feb}</style></head><body>"
+            "img{max-width:100%;height:auto} a{color:#1a1a1a}</style></head><body>"
             f"{safe}</body></html>"
         )
     return {
@@ -430,96 +458,116 @@ def format_date(value):
         return value
 
 
+def close_imap(imap):
+    if imap is None:
+        return
+    try:
+        imap.logout()
+    except Exception:
+        try:
+            imap.shutdown()
+        except Exception:
+            return
+
+
 def read_inbox(imap, limit):
     status, _ = imap.select("INBOX", readonly=True)
     if status != "OK":
-        raise RuntimeError("Не удалось открыть INBOX")
+        return []
     status, data = imap.search(None, "ALL")
-    if status != "OK":
-        raise RuntimeError("Поиск писем не удался")
-    ids = data[0].split() if data and data[0] else []
+    if status != "OK" or not data:
+        return []
+    ids = data[0].split() if data[0] else []
     messages = []
     for num in ids[-limit:]:
-        status, msg_data = imap.fetch(num, "(RFC822)")
-        if status != "OK" or not msg_data or not msg_data[0]:
+        try:
+            status, msg_data = imap.fetch(num, "(RFC822)")
+        except imaplib.IMAP4.error:
             continue
-        raw = msg_data[0][1]
-        msg = email.message_from_bytes(raw)
-        messages.append(present_message(msg))
+        if status != "OK" or not msg_data or not isinstance(msg_data[0], tuple):
+            continue
+        messages.append(present_message(email.message_from_bytes(msg_data[0][1])))
     messages.reverse()
     return messages
 
 
 def access_token_for(account):
-    last_detail = "пустой ответ"
-    for scope in IMAP_SCOPES:
-        response = requests.post(
-            TOKEN_URL,
-            data={
-                "client_id": account["client_id"],
-                "refresh_token": account["refresh_token"],
-                "grant_type": "refresh_token",
-                "scope": scope,
-            },
-            timeout=30,
-        )
-        try:
-            payload = response.json()
-        except ValueError:
-            payload = {}
-        access_token = payload.get("access_token")
-        if access_token:
-            return access_token
-        last_detail = payload.get("error_description") or payload.get("error") or response.text[:300]
-    raise RuntimeError(f"Нет access_token: {last_detail}")
+    bodies = [{"scope": scope} for scope in IMAP_SCOPES]
+    bodies.append({})
+    for extra in bodies:
+        data = {
+            "client_id": account["client_id"],
+            "refresh_token": account["refresh_token"],
+            "grant_type": "refresh_token",
+        }
+        data.update(extra)
+        for attempt in range(2):
+            try:
+                response = HTTP.post(TOKEN_URL, data=data, timeout=25)
+            except requests.RequestException:
+                time.sleep(0.4)
+                continue
+            try:
+                payload = response.json()
+            except ValueError:
+                payload = {}
+            token = payload.get("access_token")
+            if token:
+                return token
+            if payload.get("error") in FATAL_TOKEN_ERRORS:
+                return ""
+            break
+    return ""
 
 
 def outlook_messages(account, limit):
-    access_token = access_token_for(account)
-
-    auth_string = f"user={account['email']}\x01auth=Bearer {access_token}\x01\x01"
-    imap = imaplib.IMAP4_SSL(OUTLOOK_IMAP, 993, timeout=30)
-    try:
-        imap.authenticate("XOAUTH2", lambda _: auth_string.encode())
-        return read_inbox(imap, limit)
-    finally:
+    token = access_token_for(account)
+    if not token:
+        return []
+    auth = f"user={account['email']}\x01auth=Bearer {token}\x01\x01".encode()
+    for host in OUTLOOK_HOSTS:
+        imap = None
         try:
-            imap.logout()
-        except imaplib.IMAP4.error:
-            imap.shutdown()
+            imap = imaplib.IMAP4_SSL(host, 993, timeout=25)
+            imap.authenticate("XOAUTH2", lambda _: auth)
+            return read_inbox(imap, limit)
+        except Exception:
+            continue
+        finally:
+            close_imap(imap)
+    return []
 
 
 def recovery_messages(account, limit):
-    imap = imaplib.IMAP4_SSL(FIRSTMAIL_IMAP, 993, timeout=30)
+    imap = None
     try:
+        imap = imaplib.IMAP4_SSL(FIRSTMAIL_IMAP, 993, timeout=25)
         imap.login(account["recovery_email"], account["recovery_password"])
         return read_inbox(imap, limit)
+    except Exception:
+        return []
     finally:
-        try:
-            imap.logout()
-        except imaplib.IMAP4.error:
-            imap.shutdown()
+        close_imap(imap)
 
 
-def check_account(account, limit, with_recovery):
-    block = {
-        "email": account["email"],
-        "error": None,
-        "messages": [],
-        "recovery_email": account["recovery_email"],
-        "recovery": None,
-        "recovery_error": None,
-    }
+def stamp(messages, source):
+    for message in messages:
+        message["source"] = source
+    return messages
+
+
+def check_account(account):
+    messages = []
     try:
-        block["messages"] = outlook_messages(account, limit)
-    except Exception as exc:
-        block["error"] = str(exc)
-    if with_recovery:
-        try:
-            block["recovery"] = recovery_messages(account, limit)
-        except Exception as exc:
-            block["recovery_error"] = str(exc)
-    return block
+        messages.extend(stamp(outlook_messages(account, MAX_MESSAGES), "Outlook"))
+    except Exception:
+        messages = []
+    try:
+        messages.extend(stamp(recovery_messages(account, MAX_MESSAGES), "Recovery"))
+    except Exception:
+        pass
+    messages.sort(key=lambda item: item.get("date") or "", reverse=True)
+    return {"email": account["email"], "messages": messages[:MAX_MESSAGES]}
 
 
 @app.get("/health")
@@ -530,54 +578,23 @@ def health():
 @app.route("/", methods=["GET", "POST"])
 def index():
     accounts_text = ""
-    limit = 10
-    with_recovery = False
     results = []
-    if request.method == "POST":
-        accounts_text = request.form.get("accounts") or ""
-        with_recovery = request.form.get("recovery") == "1"
-        try:
-            limit = int(request.form.get("limit") or 10)
-        except ValueError:
-            limit = 10
-        limit = max(1, min(MAX_MESSAGES, limit))
-        lines = [line for line in accounts_text.splitlines() if line.strip()]
-        if len(lines) > MAX_ACCOUNTS:
-            results.append(
-                {
-                    "email": "Лимит",
-                    "error": f"За один запрос не больше {MAX_ACCOUNTS} строк",
-                    "messages": [],
-                    "recovery": None,
-                    "recovery_error": None,
-                    "recovery_email": "",
-                }
-            )
-            lines = lines[:MAX_ACCOUNTS]
-        for line in lines:
-            try:
-                account = parse_account(line)
-            except ValueError as exc:
-                results.append(
-                    {
-                        "email": line.split(":", 1)[0][:80],
-                        "error": str(exc),
-                        "messages": [],
-                        "recovery": None,
-                        "recovery_error": None,
-                        "recovery_email": "",
-                    }
-                )
-                continue
-            results.append(check_account(account, limit, with_recovery))
-    return render_template_string(
-        PAGE,
-        accounts=accounts_text,
-        limit=limit,
-        recovery=with_recovery,
-        results=results,
-        max_messages=MAX_MESSAGES,
-    )
+    try:
+        if request.method == "POST":
+            accounts_text = request.form.get("accounts") or ""
+            lines = [line for line in accounts_text.splitlines() if line.strip()][:MAX_ACCOUNTS]
+            for line in lines:
+                try:
+                    account = parse_account(line)
+                except ValueError:
+                    continue
+                try:
+                    results.append(check_account(account))
+                except Exception:
+                    results.append({"email": account["email"], "messages": []})
+    except Exception:
+        results = []
+    return render_template_string(PAGE, accounts=accounts_text, results=results)
 
 
 if __name__ == "__main__":
