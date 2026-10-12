@@ -83,9 +83,11 @@ PAGE = """
     button.submit:disabled { background: #8a8a8a; cursor: default; }
     h2 { margin: 2px 4px 4px; font-size: 1rem; font-weight: 600; }
     p.empty { margin: 10px 6px 4px; color: #6d6d6d; }
+    .tools { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; margin-top: 14px; }
     input.find {
-      width: 100%;
-      margin-top: 14px;
+      flex: 1;
+      min-width: 200px;
+      margin-top: 0;
       border: 0;
       border-radius: 999px;
       background: #f4f4f4;
@@ -93,6 +95,7 @@ PAGE = """
       padding: 12px 18px;
       font: inherit;
     }
+    button.refresh { margin-top: 0; white-space: nowrap; }
     input.find:focus { outline: 2px solid #2f80ed; }
     article.mail { background: #fafafa; border-radius: 26px; padding: 16px 16px 12px; margin-top: 12px; }
     article.notion { box-shadow: inset 0 0 0 2px #2f80ed; }
@@ -159,7 +162,10 @@ PAGE = """
     <button class="submit" type="submit">Открыть</button>
   </form>
   {% if results %}
-  <input id="find" class="find" type="search" placeholder="Найти письмо, например Notion">
+  <div class="tools">
+    <input id="find" class="find" type="search" placeholder="Найти письмо, например Notion">
+    <button class="submit refresh" type="submit" form="mail-form">Обновить список</button>
+  </div>
   {% endif %}
   {% macro letters(items) %}
     {% for msg in items %}
@@ -248,10 +254,12 @@ if (find) {
     });
   });
 }
-document.getElementById("mail-form").addEventListener("submit", function () {
-  const button = this.querySelector("button");
-  button.disabled = true;
-  button.textContent = "Открываем";
+document.getElementById("mail-form").addEventListener("submit", function (event) {
+  document.querySelectorAll("button.submit").forEach(function (button) {
+    button.disabled = true;
+  });
+  const clicked = event.submitter;
+  if (clicked) clicked.textContent = clicked.classList.contains("refresh") ? "Обновляем" : "Открываем";
 });
 </script>
 </body>
