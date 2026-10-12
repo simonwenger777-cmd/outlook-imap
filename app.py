@@ -83,7 +83,30 @@ PAGE = """
     button.submit:disabled { background: #8a8a8a; cursor: default; }
     h2 { margin: 2px 4px 4px; font-size: 1rem; font-weight: 600; }
     p.empty { margin: 10px 6px 4px; color: #6d6d6d; }
+    input.find {
+      width: 100%;
+      margin-top: 14px;
+      border: 0;
+      border-radius: 999px;
+      background: #f4f4f4;
+      color: #1a1a1a;
+      padding: 12px 18px;
+      font: inherit;
+    }
+    input.find:focus { outline: 2px solid #2f80ed; }
     article.mail { background: #fafafa; border-radius: 26px; padding: 16px 16px 12px; margin-top: 12px; }
+    article.notion { box-shadow: inset 0 0 0 2px #2f80ed; }
+    .badge {
+      background: #2f80ed;
+      color: #fff;
+      border-radius: 999px;
+      padding: 2px 10px;
+      font-size: 0.75rem;
+      font-weight: 700;
+      letter-spacing: 0.04em;
+    }
+    .preview { margin: -4px 0 12px; color: #5e5e5e; }
+    .notion-count { margin: 4px 4px 0; color: #1a56c4; font-weight: 650; }
     .who { display: flex; gap: 8px 12px; align-items: baseline; flex-wrap: wrap; color: #6a6a6a; font-size: 0.92rem; }
     .from { color: #161616; font-size: 1rem; }
     .source { letter-spacing: 0.08em; text-transform: uppercase; font-size: 0.72rem; color: #8a8a8a; }
@@ -135,16 +158,21 @@ PAGE = """
     <textarea id="accounts" name="accounts" placeholder="вставьте строки аккаунтов" required>{{ accounts }}</textarea>
     <button class="submit" type="submit">Открыть</button>
   </form>
+  {% if results %}
+  <input id="find" class="find" type="search" placeholder="Найти письмо, например Notion">
+  {% endif %}
   {% macro letters(items) %}
     {% for msg in items %}
-    <article class="mail">
+    <article class="mail{% if msg.notion %} notion{% endif %}" data-find="{{ (msg.from ~ ' ' ~ msg.subject ~ ' ' ~ msg.preview ~ ' ' ~ msg.source) | lower }}">
       <div class="who">
+        {% if msg.notion %}<span class="badge">Notion</span>{% endif %}
         <strong class="from">{{ msg.from_name or msg.from_addr or msg.from }}</strong>
         {% if msg.from_name and msg.from_addr %}<span>{{ msg.from_addr }}</span>{% endif %}
         <span class="source">{{ msg.source }}</span>
         <time>{{ msg.date }}</time>
       </div>
       <h3>{{ msg.subject }}</h3>
+      {% if msg.preview %}<p class="preview">{{ msg.preview }}</p>{% endif %}
       {% if msg.codes %}
       <div class="codes">
         {% for code in msg.codes %}
@@ -172,6 +200,8 @@ PAGE = """
   {% for block in results %}
   <section class="box">
     <h2>{{ block.email }}</h2>
+    {% set notion_count = block.messages | selectattr('notion') | list | length %}
+    {% if notion_count %}<p class="notion-count">Notion: {{ notion_count }}</p>{% endif %}
     {% if block.messages %}
       {{ letters(block.messages) }}
     {% else %}
@@ -208,6 +238,15 @@ async function copyCode(btn) {
     btn.classList.remove("copied");
     action.textContent = "копировать";
   }, 1400);
+}
+const find = document.getElementById("find");
+if (find) {
+  find.addEventListener("input", function () {
+    const query = find.value.trim().toLowerCase();
+    document.querySelectorAll("article.mail").forEach(function (card) {
+      card.hidden = Boolean(query) && !(card.dataset.find || "").includes(query);
+    });
+  });
 }
 document.getElementById("mail-form").addEventListener("submit", function () {
   const button = this.querySelector("button");
@@ -455,15 +494,21 @@ def present_message(msg):
             "img{max-width:100%;height:auto} a{color:#1a1a1a}</style></head><body>"
             f"{safe}</body></html>"
         )
+    subject = decode_mime(msg.get("Subject")) or "(без темы)"
+    preview = " ".join((plain or visible).split())[:180]
+    blob = " ".join([raw_from, name or "", addr or "", subject, preview]).lower()
     return {
         "from": raw_from,
         "from_name": name,
         "from_addr": addr,
-        "subject": decode_mime(msg.get("Subject")) or "(без темы)",
+        "subject": subject,
         "date": format_date(msg.get("Date")),
         "text": plain or visible,
         "html": wrapped,
-        "codes": extract_codes(decode_mime(msg.get("Subject")), plain, visible),
+        "preview": preview,
+        "notion": "notion" in blob,
+        "uid": (msg.get("Message-ID") or f"{addr}|{subject}|{msg.get('Date')}").strip(),
+        "codes": extract_codes(subject, plain, visible),
     }
 
 
@@ -488,16 +533,49 @@ def close_imap(imap):
             return
 
 
-def read_inbox(imap, limit):
-    status, _ = imap.select("INBOX", readonly=True)
-    if status != "OK":
+def mailbox_name(item):
+    text = item.decode("utf-8", "replace") if isinstance(item, bytes) else str(item)
+    quoted = re.findall(r'"([^"]*)"', text)
+    if quoted:
+        return quoted[-1]
+    parts = text.split()
+    return parts[-1] if parts else ""
+
+
+def interesting_mailboxes(imap):
+    names = []
+    try:
+        status, data = imap.list()
+        if status == "OK":
+            names = [mailbox_name(item) for item in data or [] if item]
+    except imaplib.IMAP4.error:
+        names = []
+    chosen = []
+    seen = set()
+    for name in names:
+        key = name.lower()
+        if key == "inbox" or "junk" in key or "spam" in key or key in {"bulk mail", "bulk"}:
+            if key not in seen:
+                seen.add(key)
+                chosen.append(name)
+    if "inbox" not in seen:
+        chosen.insert(0, "INBOX")
+    return chosen
+
+
+def search_ids(imap, criteria):
+    try:
+        status, data = imap.search(None, criteria)
+    except imaplib.IMAP4.error:
         return []
-    status, data = imap.search(None, "ALL")
-    if status != "OK" or not data:
+    if status != "OK" or not data or not data[0]:
         return []
-    ids = data[0].split() if data[0] else []
+    return data[0].split()
+
+
+def fetch_ids(imap, ids):
     messages = []
-    for num in ids[-limit:]:
+    for num in ids:
         try:
             status, msg_data = imap.fetch(num, "(RFC822)")
         except imaplib.IMAP4.error:
@@ -505,8 +583,30 @@ def read_inbox(imap, limit):
         if status != "OK" or not msg_data or not isinstance(msg_data[0], tuple):
             continue
         messages.append(present_message(email.message_from_bytes(msg_data[0][1])))
-    messages.reverse()
     return messages
+
+
+def read_folder(imap, mailbox, recent_limit):
+    target = f'"{mailbox}"' if any(char in mailbox for char in ' "') else mailbox
+    try:
+        status, _ = imap.select(target, readonly=True)
+    except imaplib.IMAP4.error:
+        return []
+    if status != "OK":
+        return []
+    recent = search_ids(imap, "ALL")[-recent_limit:] if recent_limit else []
+    notion = search_ids(imap, '(OR FROM "notion" SUBJECT "notion")')[-20:]
+    ordered = []
+    seen = set()
+    for num in list(notion) + list(recent):
+        if num not in seen:
+            seen.add(num)
+            ordered.append(num)
+    return fetch_ids(imap, ordered)
+
+
+def read_inbox(imap, limit):
+    return read_folder(imap, "INBOX", limit)
 
 
 def access_token_for(account):
@@ -548,7 +648,11 @@ def outlook_messages(account, limit):
         try:
             imap = imaplib.IMAP4_SSL(host, 993, timeout=25)
             imap.authenticate("XOAUTH2", lambda _: auth)
-            return read_inbox(imap, limit)
+            found = []
+            for mailbox in interesting_mailboxes(imap):
+                recent = limit if mailbox.lower() == "inbox" else 0
+                found.extend(read_folder(imap, mailbox, recent))
+            return dedupe_messages(found)
         except Exception:
             continue
         finally:
@@ -574,18 +678,37 @@ def stamp(messages, source):
     return messages
 
 
+def dedupe_messages(messages):
+    unique = []
+    seen = set()
+    for message in messages:
+        key = message.get("uid") or f"{message.get('from')}|{message.get('date')}|{message.get('subject')}"
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(message)
+    return unique
+
+
+def by_date(messages):
+    return sorted(messages, key=lambda item: item.get("date") or "", reverse=True)
+
+
 def check_account(account):
-    messages = []
+    outlook = []
+    recovery = []
     try:
-        messages.extend(stamp(outlook_messages(account, MAX_MESSAGES), "Outlook"))
+        outlook = stamp(outlook_messages(account, 25), "Outlook")
     except Exception:
-        messages = []
+        outlook = []
     try:
-        messages.extend(stamp(recovery_messages(account, MAX_MESSAGES), "Recovery"))
+        recovery = stamp(recovery_messages(account, 8), "Recovery")
     except Exception:
-        pass
-    messages.sort(key=lambda item: item.get("date") or "", reverse=True)
-    return {"email": account["email"], "messages": messages[:MAX_MESSAGES]}
+        recovery = []
+    notion = by_date([item for item in outlook + recovery if item.get("notion")])
+    rest = by_date([item for item in outlook if not item.get("notion")])[:20]
+    rest.extend(by_date([item for item in recovery if not item.get("notion")])[:8])
+    return {"email": account["email"], "messages": dedupe_messages(notion + rest)}
 
 
 @app.get("/health")
