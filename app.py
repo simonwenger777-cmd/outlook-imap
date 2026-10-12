@@ -73,10 +73,11 @@ PAGE = """
       margin-top: 14px;
       border: 0;
       border-radius: 999px;
-      background: #1a1a1a;
-      color: #f7f7f7;
+      background: #2f80ed;
+      color: #fff;
       padding: 12px 22px;
       font: inherit;
+      font-weight: 650;
       cursor: pointer;
     }
     button.submit:disabled { background: #8a8a8a; cursor: default; }
@@ -91,16 +92,30 @@ PAGE = """
     .codes { display: flex; flex-wrap: wrap; gap: 8px; margin: 0 0 12px; }
     button.chip {
       display: inline-flex; align-items: center; gap: 10px;
-      border: 0; background: #ececec; color: #1a1a1a;
+      border: 0; background: #e7f1ff; color: #12315c;
       border-radius: 999px; padding: 7px 8px 7px 16px;
       font: inherit; cursor: pointer;
     }
     button.chip .chip-value { font-family: ui-monospace, Consolas, monospace; font-size: 1.15rem; font-weight: 700; letter-spacing: 0.08em; }
-    button.chip .chip-action { background: #1a1a1a; color: #f7f7f7; border-radius: 999px; padding: 5px 12px; font-size: 0.78rem; }
-    button.chip.copied { background: #1a1a1a; color: #f7f7f7; }
-    button.chip.copied .chip-action { background: #f4f4f4; color: #1a1a1a; }
-    details summary { cursor: pointer; color: #3a3a3a; font-weight: 600; padding: 4px 0 10px; list-style: none; }
+    button.chip .chip-action { background: #2f80ed; color: #fff; border-radius: 999px; padding: 5px 12px; font-size: 0.78rem; font-weight: 650; }
+    button.chip.copied { background: #2f80ed; color: #fff; }
+    button.chip.copied .chip-action { background: #fff; color: #1a56c4; }
+    details summary {
+      display: inline-flex;
+      align-items: center;
+      cursor: pointer;
+      background: #2f80ed;
+      color: #fff;
+      font-weight: 650;
+      border-radius: 999px;
+      padding: 8px 16px;
+      list-style: none;
+    }
     details summary::-webkit-details-marker { display: none; }
+    details .when-open { display: none; }
+    details[open] .when-open { display: inline; }
+    details[open] .when-closed { display: none; }
+    details[open] summary { margin-bottom: 12px; }
     iframe.letter, pre.body {
       width: 100%; min-height: 240px; border: 0; border-radius: 22px; background: #fff;
       filter: grayscale(1);
@@ -140,8 +155,11 @@ PAGE = """
         {% endfor %}
       </div>
       {% endif %}
-      <details {% if msg.codes %}open{% endif %}>
-        <summary>{% if msg.codes %}Письмо{% else %}Открыть письмо{% endif %}</summary>
+      <details>
+        <summary>
+          <span class="when-closed">Развернуть письмо</span>
+          <span class="when-open">Свернуть письмо</span>
+        </summary>
         {% if msg.html %}
         <iframe class="letter" sandbox="allow-same-origin allow-popups allow-popups-to-escape-sandbox" srcdoc="{{ msg.html }}" onload="fitFrame(this)"></iframe>
         {% else %}
