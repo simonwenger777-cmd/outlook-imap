@@ -325,6 +325,7 @@ CODE_NEAR = re.compile(
     r"|(?<![A-Za-z0-9])((?=[A-Za-z0-9]*[A-Za-z])(?=[A-Za-z0-9]*\d)[A-Za-z0-9]{5,8})(?![A-Za-z0-9])"
 )
 CODE_SPACED = re.compile(r"(?<!\d)(\d{2,4}(?:[ \u00a0]\d{2,4}){1,2})")
+CODE_HYPHEN = re.compile(r"(?<!\d)(\d{3})\s*[-‐‑‒–—−]\s*(\d{3})(?!\s*[-‐‑‒–—−]?\d)")
 
 
 def part_text(part):
@@ -368,6 +369,7 @@ def html_to_text(html):
 
 def add_code(found, seen, raw):
     code = re.sub(r"[ \u00a0]+", "", raw or "")
+    code = re.sub(r"[‐‑‒–—−]", "-", code)
     if not (4 <= len(code) <= 8) or not re.fullmatch(r"[A-Za-z0-9]+(?:-[A-Za-z0-9]+)?", code):
         return
     digits = re.sub(r"\D", "", code)
@@ -403,6 +405,10 @@ def code_lines(text):
         if spaced:
             values.append(spaced.group(1))
             continue
+        hyphen = re.fullmatch(r"(\d{3})\s*[-‐‑‒–—−]\s*(\d{3})", line)
+        if hyphen:
+            values.append(f"{hyphen.group(1)}-{hyphen.group(2)}")
+            continue
         if " " in line:
             continue
         if re.fullmatch(r"[A-Za-z]-\d{3,6}|\d{4,8}", line):
@@ -418,7 +424,7 @@ def candidates_near(window):
     def buried(span):
         return any(span[0] >= start and span[1] <= end for start, end in runs)
 
-    six = []
+    six = [f"{match.group(1)}-{match.group(2)}" for match in CODE_HYPHEN.finditer(window)]
     other = []
     for match in CODE_NEAR.finditer(window):
         if buried(match.span()):
@@ -459,6 +465,10 @@ def extract_codes(*chunks):
         if take_code(found, seen, candidates_near(window) or candidates_near(before)):
             if len(found) >= 3:
                 break
+    for match in CODE_HYPHEN.finditer(text):
+        add_code(found, seen, f"{match.group(1)}-{match.group(2)}")
+        if len(found) >= 4:
+            return found
     if not found:
         take_code(found, seen, code_lines(text))
     elif labeled:
