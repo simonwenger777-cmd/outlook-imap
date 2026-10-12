@@ -455,6 +455,7 @@ def extract_codes(*chunks):
     text = "\n".join(chunk for chunk in chunks if chunk)
     text = re.sub(r"https?://\S+", " ", text)
     text = text.replace("\u00a0", " ")
+    text = re.sub(r"\b[A-Z]{2}\s+\d{5}(?:-\d{4})?\b", " ", text)
     found = []
     seen = set()
     labeled = False
