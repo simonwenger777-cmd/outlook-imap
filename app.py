@@ -207,7 +207,9 @@ PAGE = """
   <section class="box">
     <h2>{{ block.email }}</h2>
     {% set notion_count = block.messages | selectattr('notion') | list | length %}
+    {% set spam_count = block.messages | selectattr('source', 'equalto', 'Спам') | list | length %}
     {% if notion_count %}<p class="notion-count">Notion: {{ notion_count }}</p>{% endif %}
+    {% if spam_count %}<p class="notion-count">Спам: {{ spam_count }}</p>{% endif %}
     {% if block.messages %}
       {{ letters(block.messages) }}
     {% else %}
@@ -550,25 +552,30 @@ def mailbox_name(item):
     return parts[-1] if parts else ""
 
 
-def interesting_mailboxes(imap):
-    names = []
+def junk_mailboxes(imap):
+    found = []
+    seen = set()
     try:
         status, data = imap.list()
-        if status == "OK":
-            names = [mailbox_name(item) for item in data or [] if item]
-    except imaplib.IMAP4.error:
-        names = []
-    chosen = []
-    seen = set()
-    for name in names:
-        key = name.lower()
-        if key == "inbox" or "junk" in key or "spam" in key or key in {"bulk mail", "bulk"}:
-            if key not in seen:
+    except (imaplib.IMAP4.error, OSError):
+        status, data = "NO", []
+    if status == "OK":
+        for item in data or []:
+            if not item:
+                continue
+            text = item.decode("utf-8", "replace") if isinstance(item, bytes) else str(item)
+            name = mailbox_name(item)
+            key = name.lower()
+            if not name or key in seen:
+                continue
+            if "\\junk" in text.lower() or any(word in key for word in ("junk", "spam", "bulk", "нежелатель", "спам")):
                 seen.add(key)
-                chosen.append(name)
-    if "inbox" not in seen:
-        chosen.insert(0, "INBOX")
-    return chosen
+                found.append(name)
+    for name in ("Junk", "Junk Email", "Spam"):
+        if name.lower() not in seen:
+            seen.add(name.lower())
+            found.append(name)
+    return found[:3]
 
 
 def search_ids(imap, *criteria):
@@ -579,21 +586,6 @@ def search_ids(imap, *criteria):
     if status != "OK" or not data or not data[0]:
         return []
     return data[0].split()
-
-
-def notion_header_ids(imap, ids):
-    found = []
-    for num in ids:
-        try:
-            status, data = imap.fetch(num, "(BODY.PEEK[HEADER.FIELDS (FROM SUBJECT)])")
-        except (imaplib.IMAP4.error, OSError):
-            continue
-        if status != "OK" or not data:
-            continue
-        raw = b"".join(part[1] for part in data if isinstance(part, tuple) and part[1])
-        if b"notion" in raw.lower():
-            found.append(num)
-    return found
 
 
 def fetch_ids(imap, ids):
@@ -609,30 +601,19 @@ def fetch_ids(imap, ids):
     return messages
 
 
-def read_folder(imap, mailbox, recent_limit):
-    target = f'"{mailbox}"' if any(char in mailbox for char in ' "') else mailbox
+def read_recent(imap, mailbox, limit):
     try:
-        status, _ = imap.select(target, readonly=True)
-    except imaplib.IMAP4.error:
+        status, _ = imap.select(mailbox, readonly=True)
+    except (imaplib.IMAP4.error, OSError):
         return []
     if status != "OK":
         return []
-    all_ids = search_ids(imap, "ALL")
-    recent = all_ids[-recent_limit:] if recent_limit else []
-    notion = search_ids(imap, "FROM", "notion") + search_ids(imap, "SUBJECT", "notion")
-    if not notion:
-        notion = notion_header_ids(imap, all_ids[-80:])
-    ordered = []
-    seen = set()
-    for num in list(notion[-30:]) + list(recent):
-        if num not in seen:
-            seen.add(num)
-            ordered.append(num)
-    return fetch_ids(imap, ordered)
+    ids = search_ids(imap, "ALL")[-limit:]
+    return fetch_ids(imap, list(reversed(ids)))
 
 
 def read_inbox(imap, limit):
-    return read_folder(imap, "INBOX", limit)
+    return read_recent(imap, "INBOX", limit)
 
 
 def access_token_for(account):
@@ -667,29 +648,26 @@ def access_token_for(account):
 def outlook_messages(account, limit):
     token = access_token_for(account)
     if not token:
-        return []
+        return [], []
     auth = f"user={account['email']}\x01auth=Bearer {token}\x01\x01".encode()
     for host in OUTLOOK_HOSTS:
         imap = None
         try:
             imap = imaplib.IMAP4_SSL(host, 993, timeout=25)
             imap.authenticate("XOAUTH2", lambda _: auth)
-            found = []
-            mailboxes = interesting_mailboxes(imap)
-            mailboxes.sort(key=lambda name: 0 if name.lower() == "inbox" else 1)
-            for mailbox in mailboxes[:4]:
+            inbox = read_recent(imap, "INBOX", limit)
+            spam = []
+            for mailbox in junk_mailboxes(imap):
                 try:
-                    recent = limit if mailbox.lower() == "inbox" else 0
-                    found.extend(read_folder(imap, mailbox, recent))
+                    spam.extend(read_recent(imap, mailbox, limit))
                 except Exception:
                     continue
-            if found:
-                return dedupe_messages(found)
+            return dedupe_messages(inbox), dedupe_messages(spam)
         except Exception:
             continue
         finally:
             close_imap(imap)
-    return []
+    return [], []
 
 
 def recovery_messages(account, limit):
@@ -727,20 +705,23 @@ def by_date(messages):
 
 
 def check_account(account):
-    outlook = []
+    inbox = []
+    spam = []
     recovery = []
     try:
-        outlook = stamp(outlook_messages(account, 25), "Outlook")
+        inbox, spam = outlook_messages(account, 20)
+        inbox = stamp(inbox, "Outlook")
+        spam = stamp(spam, "Спам")
     except Exception:
-        outlook = []
+        inbox, spam = [], []
     try:
         recovery = stamp(recovery_messages(account, 8), "Recovery")
     except Exception:
         recovery = []
-    notion = by_date([item for item in outlook + recovery if item.get("notion")])
-    rest = by_date([item for item in outlook if not item.get("notion")])[:20]
-    rest.extend(by_date([item for item in recovery if not item.get("notion")])[:8])
-    return {"email": account["email"], "messages": dedupe_messages(notion + rest)}
+    return {
+        "email": account["email"],
+        "messages": by_date(dedupe_messages(inbox + spam + recovery)),
+    }
 
 
 @app.get("/health")
