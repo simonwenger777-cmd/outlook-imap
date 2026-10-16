@@ -349,7 +349,7 @@ function applyLang(lang) {
     if (pack[node.dataset.source]) node.textContent = pack[node.dataset.source];
   });
   document.querySelectorAll("time").forEach(function (node) {
-    node.textContent = node.textContent.replace(/\s(?:МСК|MSK)\s*$/, " " + pack.tz);
+    node.textContent = node.textContent.replace(/\\s(?:МСК|MSK)\\s*$/, " " + pack.tz);
   });
   document.querySelectorAll("[data-spam-count]").forEach(function (node) {
     node.textContent = pack.spam + ": " + node.dataset.spamCount;
@@ -675,6 +675,34 @@ def mailbox_name(item):
     return match.group(1) if match.group(1) is not None else match.group(2)
 
 
+def quote_mailbox(name):
+    if str(name).upper() == "INBOX":
+        return "INBOX"
+    return '"' + str(name).replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+SKIP_FOLDER = (
+    "sent", "draft", "deleted", "trash", "outbox", "calendar", "contact",
+    "tasks", "notes", "journal", "sync issue", "conflict", "local failure",
+    "server failure", "rss", "conversation history", "scheduled",
+    "отправлен", "черновик", "удален", "удалён", "корзин",
+)
+KEEP_FOLDER = ("archive", "clutter", "notion", "архив")
+
+
+def folder_role(name, junk):
+    key = name.lower()
+    if key == "inbox":
+        return "inbox"
+    if junk or any(word in key for word in ("junk", "spam", "bulk", "нежелатель", "спам")):
+        return "junk"
+    if any(word in key for word in SKIP_FOLDER):
+        return "skip"
+    if any(word in key for word in KEEP_FOLDER):
+        return "keep"
+    return "other"
+
+
 def listed_mailboxes(imap):
     boxes = []
     seen = set()
@@ -702,38 +730,86 @@ def listed_mailboxes(imap):
     return boxes
 
 
-def notion_header_ids(imap, ids):
+def header_has_notion(raw):
+    if not raw:
+        return False
+    if b"notion" in raw.lower():
+        return True
+    try:
+        text = decode_mime(raw.decode("utf-8", "replace"))
+    except Exception:
+        return False
+    return "notion" in text.lower()
+
+
+def parse_header_fetch(data):
     found = []
-    for num in ids[-40:]:
-        try:
-            status, data = imap.fetch(num, "(BODY.PEEK[HEADER.FIELDS (FROM SUBJECT)])")
-        except (imaplib.IMAP4.error, OSError):
+    for part in data or []:
+        if isinstance(part, tuple) and len(part) >= 2 and part[1]:
+            prefix = part[0] if isinstance(part[0], (bytes, bytearray)) else str(part[0]).encode()
+            raw = part[1] if isinstance(part[1], (bytes, bytearray)) else str(part[1]).encode()
+        elif isinstance(part, (bytes, bytearray)):
+            prefix = raw = part
+        else:
             continue
-        if status != "OK" or not data:
-            continue
-        raw = b"".join(part[1] for part in data if isinstance(part, tuple) and part[1])
-        if b"notion" in raw.lower():
-            found.append(num)
+        match = re.match(rb"\s*(\d+)", prefix)
+        if match and header_has_notion(raw):
+            found.append(match.group(1))
     return found
 
 
-def read_mailbox(imap, mailbox, recent_limit, scan_headers):
+def mailbox_count(data):
     try:
-        status, _ = imap.select(mailbox, readonly=True)
+        return int(data[0])
+    except (TypeError, ValueError, IndexError):
+        return 0
+
+
+def notion_ids_in_window(imap, count, window):
+    if count <= 0 or window <= 0:
+        return []
+    start = max(1, count - window + 1)
+    try:
+        status, data = imap.fetch(f"{start}:{count}", "(BODY.PEEK[HEADER.FIELDS (FROM SUBJECT)])")
     except (imaplib.IMAP4.error, OSError):
         return []
     if status != "OK":
         return []
-    notion = search_ids(imap, "FROM", "notion") + search_ids(imap, "SUBJECT", "notion")
-    if not notion and scan_headers:
-        notion = notion_header_ids(imap, search_ids(imap, "ALL"))
-    recent = search_ids(imap, "ALL")[-recent_limit:] if recent_limit else []
+    return parse_header_fetch(data)
+
+
+def read_mailbox(imap, mailbox, recent_limit, window):
+    try:
+        status, data = imap.select(quote_mailbox(mailbox), readonly=True)
+    except (imaplib.IMAP4.error, OSError):
+        return []
+    if status != "OK":
+        return []
+    count = mailbox_count(data)
+    if count <= 0:
+        count = len(search_ids(imap, "ALL"))
+    notion = notion_ids_in_window(imap, count, window)
+    searched = search_ids(imap, "OR", "FROM", "notion", "SUBJECT", "notion")
+    if len(searched) <= 25:
+        notion.extend(searched)
+    recent = []
+    if recent_limit and count:
+        start = max(1, count - recent_limit + 1)
+        recent = [str(num).encode() for num in range(start, count + 1)]
     ordered = []
     seen = set()
-    for num in list(notion[-15:]) + list(recent):
-        if num not in seen:
-            seen.add(num)
-            ordered.append(num)
+    for num in notion + recent:
+        token = num if isinstance(num, bytes) else str(num).encode()
+        if token in seen:
+            continue
+        seen.add(token)
+        ordered.append(token)
+    if len(ordered) > 40:
+        recent_set = set(recent)
+        kept_recent = [num for num in ordered if num in recent_set]
+        room = max(0, 40 - len(kept_recent))
+        kept_notion = [num for num in ordered if num not in recent_set][-room:]
+        ordered = kept_notion + kept_recent
     return fetch_ids(imap, ordered)
 
 
@@ -812,19 +888,31 @@ def outlook_messages(account, limit):
     for host in OUTLOOK_HOSTS:
         imap = None
         try:
-            imap = imaplib.IMAP4_SSL(host, 993, timeout=25)
+            imap = imaplib.IMAP4_SSL(host, 993, timeout=20)
             imap.authenticate("XOAUTH2", lambda _: auth)
+            if getattr(imap, "sock", None) is not None:
+                imap.sock.settimeout(12)
+            chosen = []
+            others = []
+            for name, junk in listed_mailboxes(imap):
+                role = folder_role(name, junk)
+                if role == "skip":
+                    continue
+                if role == "other":
+                    others.append((name, False))
+                else:
+                    chosen.append((name, role == "junk"))
+            if not any(name.lower() == "inbox" for name, _ in chosen):
+                chosen.insert(0, ("INBOX", False))
+            if not any(junk for _, junk in chosen):
+                chosen.append(("Junk", True))
             inbox = []
             spam = []
-            extras = 0
-            for name, junk in listed_mailboxes(imap):
-                if name.lower() != "inbox" and not junk:
-                    if extras >= 8:
-                        continue
-                    extras += 1
+            for name, junk in chosen + others[:4]:
                 try:
                     recent = limit if name.lower() == "inbox" or junk else 0
-                    messages = read_mailbox(imap, name, recent, scan_headers=name.lower() == "inbox" or junk)
+                    window = 150 if name.lower() == "inbox" or junk else 80
+                    messages = read_mailbox(imap, name, recent, window)
                 except Exception:
                     continue
                 if junk:

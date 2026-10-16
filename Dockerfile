@@ -9,4 +9,4 @@ COPY app.py .
 
 ENV PYTHONUNBUFFERED=1
 
-CMD ["sh", "-c", "exec gunicorn app:app --bind 0.0.0.0:${PORT:-10000} --timeout 90 --workers 1"]
+CMD ["sh", "-c", "exec gunicorn app:app --bind 0.0.0.0:${PORT:-10000} --timeout 120 --workers 1"]
