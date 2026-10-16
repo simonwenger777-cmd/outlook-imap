@@ -62,7 +62,7 @@ TEXT = {
 
 def ui_lang():
     try:
-        lang = g.lang
+        lang = getattr(g, "lang", None)
     except RuntimeError:
         return "ru"
     return lang if lang in TEXT else "ru"
@@ -827,6 +827,10 @@ def health():
 
 @app.route("/", methods=["GET", "POST"])
 def index():
+    lang = request.values.get("lang") or request.cookies.get("lang") or "ru"
+    if lang not in TEXT:
+        lang = "ru"
+    g.lang = lang
     accounts_text = ""
     results = []
     try:
@@ -844,10 +848,6 @@ def index():
                     results.append({"email": account["email"], "messages": []})
     except Exception:
         results = []
-    lang = request.values.get("lang") or request.cookies.get("lang") or "ru"
-    if lang not in TEXT:
-        lang = "ru"
-    g.lang = lang
     response = make_response(render_template_string(PAGE, accounts=accounts_text, results=results, lang=lang, t=TEXT[lang]))
     response.set_cookie("lang", lang, max_age=60 * 60 * 24 * 365, samesite="Lax")
     return response
