@@ -12,9 +12,60 @@ from email.utils import parseaddr, parsedate_to_datetime
 from html import unescape
 
 import requests
-from flask import Flask, render_template_string, request
+from flask import Flask, g, make_response, render_template_string, request
 
 app = Flask(__name__)
+
+TEXT = {
+    "ru": {
+        "title": "Почта",
+        "note": "Одна строка на ящик: email:password:recovery email:recovery password:refresh token:client id. Outlook и recovery открываются сами. Код копируется кнопкой.",
+        "placeholder": "вставьте строки аккаунтов",
+        "open": "Открыть",
+        "opening": "Открываем",
+        "find": "Найти письмо, например Notion",
+        "refresh": "Обновить список",
+        "refreshing": "Обновляем",
+        "copy": "копировать",
+        "copied": "скопировано",
+        "expand": "Развернуть письмо",
+        "collapse": "Свернуть письмо",
+        "empty": "Писем нет",
+        "no_subject": "(без темы)",
+        "tz": "МСК",
+        "outlook": "Outlook",
+        "spam": "Спам",
+        "recovery": "Recovery",
+    },
+    "en": {
+        "title": "Mail",
+        "note": "One line per mailbox: email:password:recovery email:recovery password:refresh token:client id. Outlook and recovery open together. Copy a code with the button.",
+        "placeholder": "paste account lines",
+        "open": "Open",
+        "opening": "Opening",
+        "find": "Find a message, for example Notion",
+        "refresh": "Refresh list",
+        "refreshing": "Refreshing",
+        "copy": "copy",
+        "copied": "copied",
+        "expand": "Expand message",
+        "collapse": "Collapse message",
+        "empty": "No messages",
+        "no_subject": "(no subject)",
+        "tz": "MSK",
+        "outlook": "Outlook",
+        "spam": "Spam",
+        "recovery": "Recovery",
+    },
+}
+
+
+def ui_lang():
+    try:
+        lang = g.lang
+    except RuntimeError:
+        return "ru"
+    return lang if lang in TEXT else "ru"
 
 TOKEN_URL = "https://login.microsoftonline.com/common/oauth2/v2.0/token"
 OUTLOOK_IMAP = "outlook.office365.com"
@@ -38,7 +89,7 @@ PAGE = """
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="light">
-  <title>Почта</title>
+  <title>{{ t.title }}</title>
   <style>
     :root { color-scheme: light; }
     * { box-sizing: border-box; }
@@ -48,6 +99,12 @@ PAGE = """
       color: #1a1a1a;
       font: 15px/1.5 "Segoe UI", system-ui, sans-serif;
     }
+    .langs { position: fixed; top: 16px; right: 16px; display: flex; gap: 6px; z-index: 2; }
+    button.lang {
+      border: 0; border-radius: 999px; background: #f4f4f4; color: #1a1a1a;
+      padding: 8px 14px; font: inherit; font-weight: 700; cursor: pointer;
+    }
+    button.lang.active { background: #2f80ed; color: #fff; }
     main { max-width: 760px; margin: 0 auto; padding: 40px 16px 88px; }
     h1 { margin: 0 0 8px; font-size: 1.7rem; font-weight: 600; letter-spacing: -0.04em; }
     p.note { margin: 0 0 18px; color: #5e5e5e; }
@@ -154,18 +211,23 @@ PAGE = """
     }
   </style>
 </head>
-<body>
+<body data-copied="{{ t.copied }}" data-copy="{{ t.copy }}" data-opening="{{ t.opening }}" data-refreshing="{{ t.refreshing }}">
+<div class="langs">
+  <button type="button" class="lang{% if lang == 'ru' %} active{% endif %}" data-lang="ru">RU</button>
+  <button type="button" class="lang{% if lang == 'en' %} active{% endif %}" data-lang="en">EN</button>
+</div>
 <main>
-  <h1>Почта</h1>
-  <p class="note">Одна строка на ящик: email:password:recovery email:recovery password:refresh token:client id. Outlook и recovery открываются сами. Код копируется кнопкой.</p>
+  <h1>{{ t.title }}</h1>
+  <p class="note">{{ t.note }}</p>
   <form class="panel" method="post" id="mail-form">
-    <textarea id="accounts" name="accounts" placeholder="вставьте строки аккаунтов" required>{{ accounts }}</textarea>
-    <button class="submit" type="submit">Открыть</button>
+    <input type="hidden" name="lang" value="{{ lang }}">
+    <textarea id="accounts" name="accounts" placeholder="{{ t.placeholder }}" required>{{ accounts }}</textarea>
+    <button class="submit" type="submit">{{ t.open }}</button>
   </form>
   {% if results %}
   <div class="tools">
-    <input id="find" class="find" type="search" placeholder="Найти письмо, например Notion">
-    <button class="submit refresh" type="submit" form="mail-form">Обновить список</button>
+    <input id="find" class="find" type="search" placeholder="{{ t.find }}">
+    <button class="submit refresh" type="submit" form="mail-form">{{ t.refresh }}</button>
   </div>
   {% endif %}
   {% macro letters(items) %}
@@ -175,7 +237,7 @@ PAGE = """
         {% if msg.notion %}<span class="badge">Notion</span>{% endif %}
         <strong class="from">{{ msg.from_name or msg.from_addr or msg.from }}</strong>
         {% if msg.from_name and msg.from_addr %}<span>{{ msg.from_addr }}</span>{% endif %}
-        <span class="source">{{ msg.source }}</span>
+        <span class="source">{{ t[msg.source] }}</span>
         <time>{{ msg.date }}</time>
       </div>
       <h3>{{ msg.subject }}</h3>
@@ -185,15 +247,15 @@ PAGE = """
         {% for code in msg.codes %}
         <button type="button" class="chip" data-code="{{ code }}" onclick="copyCode(this)">
           <span class="chip-value">{{ code }}</span>
-          <span class="chip-action">копировать</span>
+          <span class="chip-action">{{ t.copy }}</span>
         </button>
         {% endfor %}
       </div>
       {% endif %}
       <details>
         <summary>
-          <span class="when-closed">Развернуть письмо</span>
-          <span class="when-open">Свернуть письмо</span>
+          <span class="when-closed">{{ t.expand }}</span>
+          <span class="when-open">{{ t.collapse }}</span>
         </summary>
         {% if msg.html %}
         <iframe class="letter" sandbox="allow-same-origin allow-popups allow-popups-to-escape-sandbox" srcdoc="{{ msg.html }}" onload="fitFrame(this)"></iframe>
@@ -208,13 +270,13 @@ PAGE = """
   <section class="box">
     <h2>{{ block.email }}</h2>
     {% set notion_count = block.messages | selectattr('notion') | list | length %}
-    {% set spam_count = block.messages | selectattr('source', 'equalto', 'Спам') | list | length %}
+    {% set spam_count = block.messages | selectattr('source', 'equalto', 'spam') | list | length %}
     {% if notion_count %}<p class="notion-count">Notion: {{ notion_count }}</p>{% endif %}
-    {% if spam_count %}<p class="notion-count">Спам: {{ spam_count }}</p>{% endif %}
+    {% if spam_count %}<p class="notion-count">{{ t.spam }}: {{ spam_count }}</p>{% endif %}
     {% if block.messages %}
       {{ letters(block.messages) }}
     {% else %}
-      <p class="empty">Писем нет</p>
+      <p class="empty">{{ t.empty }}</p>
     {% endif %}
   </section>
   {% endfor %}
@@ -241,11 +303,12 @@ async function copyCode(btn) {
     area.remove();
   }
   const action = btn.querySelector(".chip-action");
+  const labels = document.body.dataset;
   btn.classList.add("copied");
-  action.textContent = "скопировано";
+  action.textContent = labels.copied;
   setTimeout(() => {
     btn.classList.remove("copied");
-    action.textContent = "копировать";
+    action.textContent = labels.copy;
   }, 1400);
 }
 const find = document.getElementById("find");
@@ -261,8 +324,23 @@ document.getElementById("mail-form").addEventListener("submit", function (event)
   document.querySelectorAll("button.submit").forEach(function (button) {
     button.disabled = true;
   });
+  const labels = document.body.dataset;
   const clicked = event.submitter;
-  if (clicked) clicked.textContent = clicked.classList.contains("refresh") ? "Обновляем" : "Открываем";
+  if (clicked) clicked.textContent = clicked.classList.contains("refresh") ? labels.refreshing : labels.opening;
+});
+document.querySelectorAll("button.lang").forEach(function (button) {
+  button.addEventListener("click", function () {
+    const lang = button.dataset.lang;
+    document.cookie = "lang=" + lang + ";path=/;max-age=31536000;samesite=lax";
+    const hidden = document.querySelector("input[name=lang]");
+    hidden.value = lang;
+    const accounts = document.getElementById("accounts").value.trim();
+    if (accounts) {
+      document.getElementById("mail-form").requestSubmit();
+      return;
+    }
+    location.href = "/?lang=" + lang;
+  });
 });
 </script>
 </body>
@@ -516,7 +594,7 @@ def present_message(msg):
             "img{max-width:100%;height:auto} a{color:#1a1a1a}</style></head><body>"
             f"{safe}</body></html>"
         )
-    subject = decode_mime(msg.get("Subject")) or "(без темы)"
+    subject = decode_mime(msg.get("Subject")) or TEXT[ui_lang()]["no_subject"]
     preview = " ".join((plain or visible).split())[:180]
     blob = " ".join([raw_from, name or "", addr or "", subject, preview]).lower()
     return {
@@ -546,7 +624,7 @@ def format_date(value):
         return value
     if moment.tzinfo is None:
         moment = moment.replace(tzinfo=timezone.utc)
-    return moment.astimezone(MSK).strftime("%Y-%m-%d %H:%M") + " МСК"
+    return moment.astimezone(MSK).strftime("%Y-%m-%d %H:%M") + " " + TEXT[ui_lang()]["tz"]
 
 
 def close_imap(imap):
@@ -728,12 +806,12 @@ def check_account(account):
     recovery = []
     try:
         inbox, spam = outlook_messages(account, 20)
-        inbox = stamp(inbox, "Outlook")
-        spam = stamp(spam, "Спам")
+        inbox = stamp(inbox, "outlook")
+        spam = stamp(spam, "spam")
     except Exception:
         inbox, spam = [], []
     try:
-        recovery = stamp(recovery_messages(account, 8), "Recovery")
+        recovery = stamp(recovery_messages(account, 8), "recovery")
     except Exception:
         recovery = []
     return {
@@ -766,7 +844,13 @@ def index():
                     results.append({"email": account["email"], "messages": []})
     except Exception:
         results = []
-    return render_template_string(PAGE, accounts=accounts_text, results=results)
+    lang = request.values.get("lang") or request.cookies.get("lang") or "ru"
+    if lang not in TEXT:
+        lang = "ru"
+    g.lang = lang
+    response = make_response(render_template_string(PAGE, accounts=accounts_text, results=results, lang=lang, t=TEXT[lang]))
+    response.set_cookie("lang", lang, max_age=60 * 60 * 24 * 365, samesite="Lax")
+    return response
 
 
 if __name__ == "__main__":
