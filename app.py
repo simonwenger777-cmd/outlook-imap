@@ -84,7 +84,7 @@ HTTP = requests.Session()
 
 PAGE = """
 <!doctype html>
-<html lang="ru">
+<html lang="{{ lang }}">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -217,17 +217,17 @@ PAGE = """
   <button type="button" class="lang{% if lang == 'en' %} active{% endif %}" data-lang="en">EN</button>
 </div>
 <main>
-  <h1>{{ t.title }}</h1>
-  <p class="note">{{ t.note }}</p>
+  <h1 data-i18n="title">{{ t.title }}</h1>
+  <p class="note" data-i18n="note">{{ t.note }}</p>
   <form class="panel" method="post" id="mail-form">
     <input type="hidden" name="lang" value="{{ lang }}">
-    <textarea id="accounts" name="accounts" placeholder="{{ t.placeholder }}" required>{{ accounts }}</textarea>
-    <button class="submit" type="submit">{{ t.open }}</button>
+    <textarea id="accounts" name="accounts" data-i18n-placeholder="placeholder" placeholder="{{ t.placeholder }}" required>{{ accounts }}</textarea>
+    <button class="submit" type="submit" data-i18n="open">{{ t.open }}</button>
   </form>
   {% if results %}
   <div class="tools">
-    <input id="find" class="find" type="search" placeholder="{{ t.find }}">
-    <button class="submit refresh" type="submit" form="mail-form">{{ t.refresh }}</button>
+    <input id="find" class="find" type="search" data-i18n-placeholder="find" placeholder="{{ t.find }}">
+    <button class="submit refresh" type="submit" form="mail-form" data-i18n="refresh">{{ t.refresh }}</button>
   </div>
   {% endif %}
   {% macro letters(items) %}
@@ -237,25 +237,25 @@ PAGE = """
         {% if msg.notion %}<span class="badge">Notion</span>{% endif %}
         <strong class="from">{{ msg.from_name or msg.from_addr or msg.from }}</strong>
         {% if msg.from_name and msg.from_addr %}<span>{{ msg.from_addr }}</span>{% endif %}
-        <span class="source">{{ t[msg.source] }}</span>
+        <span class="source" data-source="{{ msg.source }}">{{ t[msg.source] }}</span>
         <time>{{ msg.date }}</time>
       </div>
-      <h3>{{ msg.subject }}</h3>
+      <h3{% if msg.subject == t.no_subject %} data-i18n="no_subject"{% endif %}>{{ msg.subject }}</h3>
       {% if msg.preview %}<p class="preview">{{ msg.preview }}</p>{% endif %}
       {% if msg.codes %}
       <div class="codes">
         {% for code in msg.codes %}
         <button type="button" class="chip" data-code="{{ code }}" onclick="copyCode(this)">
           <span class="chip-value">{{ code }}</span>
-          <span class="chip-action">{{ t['copy'] }}</span>
+          <span class="chip-action" data-i18n="copy">{{ t['copy'] }}</span>
         </button>
         {% endfor %}
       </div>
       {% endif %}
       <details>
         <summary>
-          <span class="when-closed">{{ t.expand }}</span>
-          <span class="when-open">{{ t.collapse }}</span>
+          <span class="when-closed" data-i18n="expand">{{ t.expand }}</span>
+          <span class="when-open" data-i18n="collapse">{{ t.collapse }}</span>
         </summary>
         {% if msg.html %}
         <iframe class="letter" sandbox="allow-same-origin allow-popups allow-popups-to-escape-sandbox" srcdoc="{{ msg.html }}" onload="fitFrame(this)"></iframe>
@@ -272,11 +272,11 @@ PAGE = """
     {% set notion_count = block.messages | selectattr('notion') | list | length %}
     {% set spam_count = block.messages | selectattr('source', 'equalto', 'spam') | list | length %}
     {% if notion_count %}<p class="notion-count">Notion: {{ notion_count }}</p>{% endif %}
-    {% if spam_count %}<p class="notion-count">{{ t.spam }}: {{ spam_count }}</p>{% endif %}
+    {% if spam_count %}<p class="notion-count" data-spam-count="{{ spam_count }}">{{ t.spam }}: {{ spam_count }}</p>{% endif %}
     {% if block.messages %}
       {{ letters(block.messages) }}
     {% else %}
-      <p class="empty">{{ t.empty }}</p>
+      <p class="empty" data-i18n="empty">{{ t.empty }}</p>
     {% endif %}
   </section>
   {% endfor %}
@@ -328,18 +328,46 @@ document.getElementById("mail-form").addEventListener("submit", function (event)
   const clicked = event.submitter;
   if (clicked) clicked.textContent = clicked.classList.contains("refresh") ? labels.refreshing : labels.opening;
 });
-document.querySelectorAll("button.lang").forEach(function (button) {
-  button.addEventListener("click", function () {
-    const lang = button.dataset.lang;
-    document.cookie = "lang=" + lang + ";path=/;max-age=31536000;samesite=lax";
-    const hidden = document.querySelector("input[name=lang]");
-    hidden.value = lang;
-    const accounts = document.getElementById("accounts").value.trim();
-    if (accounts) {
-      document.getElementById("mail-form").requestSubmit();
+const I18N = {{ texts|tojson }};
+function applyLang(lang) {
+  const pack = I18N[lang] || I18N.ru;
+  document.documentElement.lang = lang;
+  document.title = pack.title;
+  document.querySelectorAll("[data-i18n]").forEach(function (node) {
+    const key = node.dataset.i18n;
+    if (node.classList.contains("chip-action") && node.closest("button.chip") && node.closest("button.chip").classList.contains("copied")) {
+      node.textContent = pack.copied;
       return;
     }
-    location.href = "/?lang=" + lang;
+    if (pack[key] != null) node.textContent = pack[key];
+  });
+  document.querySelectorAll("[data-i18n-placeholder]").forEach(function (node) {
+    const key = node.getAttribute("data-i18n-placeholder");
+    if (pack[key] != null) node.placeholder = pack[key];
+  });
+  document.querySelectorAll("[data-source]").forEach(function (node) {
+    if (pack[node.dataset.source]) node.textContent = pack[node.dataset.source];
+  });
+  document.querySelectorAll("time").forEach(function (node) {
+    node.textContent = node.textContent.replace(/\s(?:МСК|MSK)\s*$/, " " + pack.tz);
+  });
+  document.querySelectorAll("[data-spam-count]").forEach(function (node) {
+    node.textContent = pack.spam + ": " + node.dataset.spamCount;
+  });
+  document.body.dataset.copied = pack.copied;
+  document.body.dataset.copy = pack.copy;
+  document.body.dataset.opening = pack.opening;
+  document.body.dataset.refreshing = pack.refreshing;
+  document.querySelectorAll("button.lang").forEach(function (item) {
+    item.classList.toggle("active", item.dataset.lang === lang);
+  });
+  document.cookie = "lang=" + lang + ";path=/;max-age=31536000;samesite=lax";
+  const hidden = document.querySelector("input[name=lang]");
+  if (hidden) hidden.value = lang;
+}
+document.querySelectorAll("button.lang").forEach(function (button) {
+  button.addEventListener("click", function () {
+    applyLang(button.dataset.lang);
   });
 });
 </script>
@@ -893,7 +921,9 @@ def index():
                     results.append({"email": account["email"], "messages": []})
     except Exception:
         results = []
-    response = make_response(render_template_string(PAGE, accounts=accounts_text, results=results, lang=lang, t=TEXT[lang]))
+    response = make_response(render_template_string(
+        PAGE, accounts=accounts_text, results=results, lang=lang, t=TEXT[lang], texts=TEXT
+    ))
     response.set_cookie("lang", lang, max_age=60 * 60 * 24 * 365, samesite="Lax")
     return response
 
