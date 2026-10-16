@@ -211,7 +211,7 @@ PAGE = """
     }
   </style>
 </head>
-<body data-copied="{{ t.copied }}" data-copy="{{ t.copy }}" data-opening="{{ t.opening }}" data-refreshing="{{ t.refreshing }}">
+<body data-copied="{{ t.copied }}" data-copy="{{ t['copy'] }}" data-opening="{{ t.opening }}" data-refreshing="{{ t.refreshing }}">
 <div class="langs">
   <button type="button" class="lang{% if lang == 'ru' %} active{% endif %}" data-lang="ru">RU</button>
   <button type="button" class="lang{% if lang == 'en' %} active{% endif %}" data-lang="en">EN</button>
@@ -247,7 +247,7 @@ PAGE = """
         {% for code in msg.codes %}
         <button type="button" class="chip" data-code="{{ code }}" onclick="copyCode(this)">
           <span class="chip-value">{{ code }}</span>
-          <span class="chip-action">{{ t.copy }}</span>
+          <span class="chip-action">{{ t['copy'] }}</span>
         </button>
         {% endfor %}
       </div>
@@ -641,11 +641,10 @@ def close_imap(imap):
 
 def mailbox_name(item):
     text = item.decode("utf-8", "replace") if isinstance(item, bytes) else str(item)
-    quoted = re.findall(r'"([^"]*)"', text)
-    if quoted:
-        return quoted[-1]
-    parts = text.split()
-    return parts[-1] if parts else ""
+    match = re.search(r'\)\s+"(?:[^"]*)"\s+(?:"([^"]*)"|(\S+))\s*$', text)
+    if not match:
+        return ""
+    return match.group(1) if match.group(1) is not None else match.group(2)
 
 
 def junk_mailboxes(imap):
@@ -667,11 +666,9 @@ def junk_mailboxes(imap):
             if "\\junk" in text.lower() or any(word in key for word in ("junk", "spam", "bulk", "нежелатель", "спам")):
                 seen.add(key)
                 found.append(name)
-    for name in ("Junk", "Junk Email", "Spam"):
-        if name.lower() not in seen:
-            seen.add(name.lower())
-            found.append(name)
-    return found[:3]
+    if found:
+        return found
+    return ["Junk", "Junk Email", "Spam"]
 
 
 def search_ids(imap, *criteria):
