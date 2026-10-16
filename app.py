@@ -647,28 +647,66 @@ def mailbox_name(item):
     return match.group(1) if match.group(1) is not None else match.group(2)
 
 
-def junk_mailboxes(imap):
-    found = []
+def listed_mailboxes(imap):
+    boxes = []
     seen = set()
     try:
         status, data = imap.list()
     except (imaplib.IMAP4.error, OSError):
         status, data = "NO", []
-    if status == "OK":
-        for item in data or []:
-            if not item:
-                continue
-            text = item.decode("utf-8", "replace") if isinstance(item, bytes) else str(item)
-            name = mailbox_name(item)
-            key = name.lower()
-            if not name or key in seen:
-                continue
-            if "\\junk" in text.lower() or any(word in key for word in ("junk", "spam", "bulk", "нежелатель", "спам")):
-                seen.add(key)
-                found.append(name)
-    if found:
-        return found
-    return ["Junk", "Junk Email", "Spam"]
+    if status != "OK":
+        return [("INBOX", False), ("Junk", True)]
+    for item in data or []:
+        if not item:
+            continue
+        text = item.decode("utf-8", "replace") if isinstance(item, bytes) else str(item)
+        name = mailbox_name(item)
+        key = name.lower()
+        if not name or key in seen:
+            continue
+        seen.add(key)
+        junk = "\\junk" in text.lower() or any(word in key for word in ("junk", "spam", "bulk", "нежелатель", "спам"))
+        boxes.append((name, junk))
+    if "inbox" not in seen:
+        boxes.insert(0, ("INBOX", False))
+    if not any(junk for _, junk in boxes):
+        boxes.append(("Junk", True))
+    return boxes
+
+
+def notion_header_ids(imap, ids):
+    found = []
+    for num in ids[-40:]:
+        try:
+            status, data = imap.fetch(num, "(BODY.PEEK[HEADER.FIELDS (FROM SUBJECT)])")
+        except (imaplib.IMAP4.error, OSError):
+            continue
+        if status != "OK" or not data:
+            continue
+        raw = b"".join(part[1] for part in data if isinstance(part, tuple) and part[1])
+        if b"notion" in raw.lower():
+            found.append(num)
+    return found
+
+
+def read_mailbox(imap, mailbox, recent_limit, scan_headers):
+    try:
+        status, _ = imap.select(mailbox, readonly=True)
+    except (imaplib.IMAP4.error, OSError):
+        return []
+    if status != "OK":
+        return []
+    notion = search_ids(imap, "FROM", "notion") + search_ids(imap, "SUBJECT", "notion")
+    if not notion and scan_headers:
+        notion = notion_header_ids(imap, search_ids(imap, "ALL"))
+    recent = search_ids(imap, "ALL")[-recent_limit:] if recent_limit else []
+    ordered = []
+    seen = set()
+    for num in list(notion[-15:]) + list(recent):
+        if num not in seen:
+            seen.add(num)
+            ordered.append(num)
+    return fetch_ids(imap, ordered)
 
 
 def search_ids(imap, *criteria):
@@ -748,13 +786,23 @@ def outlook_messages(account, limit):
         try:
             imap = imaplib.IMAP4_SSL(host, 993, timeout=25)
             imap.authenticate("XOAUTH2", lambda _: auth)
-            inbox = read_recent(imap, "INBOX", limit)
+            inbox = []
             spam = []
-            for mailbox in junk_mailboxes(imap):
+            extras = 0
+            for name, junk in listed_mailboxes(imap):
+                if name.lower() != "inbox" and not junk:
+                    if extras >= 8:
+                        continue
+                    extras += 1
                 try:
-                    spam.extend(read_recent(imap, mailbox, limit))
+                    recent = limit if name.lower() == "inbox" or junk else 0
+                    messages = read_mailbox(imap, name, recent, scan_headers=name.lower() == "inbox" or junk)
                 except Exception:
                     continue
+                if junk:
+                    spam.extend(messages)
+                else:
+                    inbox.extend(messages)
             return dedupe_messages(inbox), dedupe_messages(spam)
         except Exception:
             continue
@@ -811,10 +859,10 @@ def check_account(account):
         recovery = stamp(recovery_messages(account, 8), "recovery")
     except Exception:
         recovery = []
-    return {
-        "email": account["email"],
-        "messages": by_date(dedupe_messages(inbox + spam + recovery)),
-    }
+    messages = dedupe_messages(inbox + spam + recovery)
+    notion = by_date([item for item in messages if item.get("notion")])
+    rest = by_date([item for item in messages if not item.get("notion")])
+    return {"email": account["email"], "messages": notion + rest}
 
 
 @app.get("/health")
