@@ -1,4 +1,4 @@
-"""Outlook OAuth2 IMAP reader plus Firstmail recovery inbox."""
+"""Outlook reader: IMAP XOAUTH2 or Microsoft Graph Mail.Read, plus Firstmail recovery."""
 
 import base64
 import email
@@ -6,10 +6,11 @@ import imaplib
 import os
 import re
 import time
-from datetime import timedelta, timezone
+from datetime import datetime, timedelta, timezone
 from email.header import decode_header
 from email.utils import parseaddr, parsedate_to_datetime
 from html import unescape
+from urllib.parse import quote
 
 import requests
 from flask import Flask, g, make_response, render_template_string, request
@@ -77,6 +78,13 @@ IMAP_SCOPES = (
     "https://outlook.office365.com/IMAP.AccessAsUser.All",
 )
 OUTLOOK_HOSTS = ("outlook.office365.com", "imap-mail.outlook.com")
+GRAPH_ROOT = "https://graph.microsoft.com/v1.0"
+GRAPH_SCOPES = (
+    "offline_access User.Read Mail.Read",
+    "https://graph.microsoft.com/Mail.Read https://graph.microsoft.com/User.Read offline_access",
+)
+GRAPH_SELECT = "id,parentFolderId,from,subject,receivedDateTime,bodyPreview,body,internetMessageId"
+GRAPH_PREVIEW = "id,parentFolderId,from,subject,receivedDateTime,bodyPreview,internetMessageId"
 FATAL_TOKEN_ERRORS = {"invalid_grant", "interaction_required", "invalid_client"}
 MAX_ACCOUNTS = 5
 MAX_MESSAGES = 12
@@ -606,38 +614,85 @@ def inline_related_images(msg, html):
     return html
 
 
-def present_message(msg):
-    plain, html_body = message_bodies(msg)
-    visible = html_to_text(html_body) if html_body else plain
-    raw_from = decode_mime(msg.get("From"))
-    name, addr = parseaddr(raw_from)
-    wrapped = ""
-    if html_body:
-        safe = inline_related_images(msg, sanitize_html(html_body))
-        wrapped = (
-            "<!doctype html><html><head><meta charset='utf-8'>"
-            "<base target='_blank'>"
-            "<style>body{margin:0;padding:16px;font:15px/1.5 Segoe UI,system-ui,sans-serif;"
-            "color:#1c2430;background:#fff;overflow-wrap:anywhere}"
-            "img{max-width:100%;height:auto} a{color:#1a1a1a}</style></head><body>"
-            f"{safe}</body></html>"
-        )
-    subject = decode_mime(msg.get("Subject")) or TEXT[ui_lang()]["no_subject"]
-    preview = " ".join((plain or visible).split())[:180]
+def wrap_html(html_body):
+    safe = sanitize_html(html_body or "")
+    return (
+        "<!doctype html><html><head><meta charset='utf-8'>"
+        "<base target='_blank'>"
+        "<style>body{margin:0;padding:16px;font:15px/1.5 Segoe UI,system-ui,sans-serif;"
+        "color:#1c2430;background:#fff;overflow-wrap:anywhere}"
+        "img{max-width:100%;height:auto} a{color:#1a1a1a}</style></head><body>"
+        f"{safe}</body></html>"
+    )
+
+
+def letter_fields(raw_from, name, addr, subject, when, plain, visible, html_body, preview, uid):
+    preview = preview or " ".join((plain or visible).split())[:180]
     blob = " ".join([raw_from, name or "", addr or "", subject, preview]).lower()
     return {
         "from": raw_from,
         "from_name": name,
         "from_addr": addr,
         "subject": subject,
-        "date": format_date(msg.get("Date")),
+        "date": format_date(when),
         "text": plain or visible,
-        "html": wrapped,
+        "html": wrap_html(html_body) if html_body else "",
         "preview": preview,
         "notion": "notion" in blob,
-        "uid": (msg.get("Message-ID") or f"{addr}|{subject}|{msg.get('Date')}").strip(),
+        "uid": (uid or f"{addr}|{subject}|{when}").strip(),
         "codes": extract_codes(subject, plain, visible),
     }
+
+
+def present_message(msg):
+    plain, html_body = message_bodies(msg)
+    visible = html_to_text(html_body) if html_body else plain
+    raw_from = decode_mime(msg.get("From"))
+    name, addr = parseaddr(raw_from)
+    if html_body:
+        html_body = inline_related_images(msg, html_body)
+    subject = decode_mime(msg.get("Subject")) or TEXT[ui_lang()]["no_subject"]
+    return letter_fields(
+        raw_from, name, addr, subject, msg.get("Date"), plain, visible, html_body, "",
+        msg.get("Message-ID"),
+    )
+
+
+def graph_sender(item):
+    sender = ((item or {}).get("from") or {}).get("emailAddress") or {}
+    name = sender.get("name") or ""
+    addr = sender.get("address") or ""
+    if name and addr:
+        raw_from = f"{name} <{addr}>"
+    else:
+        raw_from = addr or name
+    return raw_from, name, addr
+
+
+def looks_notion(item):
+    raw_from, name, addr = graph_sender(item)
+    blob = " ".join([raw_from, name, addr, item.get("subject") or "", item.get("bodyPreview") or ""]).lower()
+    return "notion" in blob
+
+
+def present_graph_message(item):
+    raw_from, name, addr = graph_sender(item)
+    body = item.get("body") or {}
+    content = body.get("content") or ""
+    preview = item.get("bodyPreview") or ""
+    if (body.get("contentType") or "").lower() == "html":
+        html_body = content
+        plain = ""
+        visible = html_to_text(html_body) if html_body else preview
+    else:
+        html_body = ""
+        plain = content or preview
+        visible = plain
+    subject = item.get("subject") or TEXT[ui_lang()]["no_subject"]
+    return letter_fields(
+        raw_from, name, addr, subject, item.get("receivedDateTime"),
+        plain, visible, html_body, preview, item.get("internetMessageId") or item.get("id"),
+    )
 
 
 MSK = timezone(timedelta(hours=3))
@@ -646,10 +701,16 @@ MSK = timezone(timedelta(hours=3))
 def format_date(value):
     if not value:
         return ""
+    moment = None
     try:
         moment = parsedate_to_datetime(value)
     except (TypeError, ValueError, IndexError, OverflowError):
-        return value
+        moment = None
+    if moment is None:
+        try:
+            moment = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        except ValueError:
+            return str(value)
     if moment.tzinfo is None:
         moment = moment.replace(tzinfo=timezone.utc)
     return moment.astimezone(MSK).strftime("%Y-%m-%d %H:%M") + " " + TEXT[ui_lang()]["tz"]
@@ -851,39 +912,188 @@ def read_inbox(imap, limit):
     return read_recent(imap, "INBOX", limit)
 
 
+def request_token(account, scope):
+    data = {
+        "client_id": account["client_id"],
+        "refresh_token": account["refresh_token"],
+        "grant_type": "refresh_token",
+    }
+    if scope:
+        data["scope"] = scope
+    for attempt in range(2):
+        try:
+            response = HTTP.post(TOKEN_URL, data=data, timeout=25)
+        except requests.RequestException:
+            time.sleep(0.4)
+            continue
+        try:
+            payload = response.json()
+        except ValueError:
+            payload = {}
+        token = payload.get("access_token")
+        if token:
+            return token, False
+        if payload.get("error") in FATAL_TOKEN_ERRORS:
+            return "", True
+        break
+    return "", False
+
+
 def access_token_for(account):
-    bodies = [{"scope": scope} for scope in IMAP_SCOPES]
-    bodies.append({})
-    for extra in bodies:
-        data = {
-            "client_id": account["client_id"],
-            "refresh_token": account["refresh_token"],
-            "grant_type": "refresh_token",
-        }
-        data.update(extra)
-        for attempt in range(2):
-            try:
-                response = HTTP.post(TOKEN_URL, data=data, timeout=25)
-            except requests.RequestException:
-                time.sleep(0.4)
-                continue
-            try:
-                payload = response.json()
-            except ValueError:
-                payload = {}
-            token = payload.get("access_token")
-            if token:
-                return token
-            if payload.get("error") in FATAL_TOKEN_ERRORS:
-                return ""
-            break
+    for scope in IMAP_SCOPES:
+        token, fatal = request_token(account, scope)
+        if token:
+            return token
+        if fatal:
+            return ""
+    token, _fatal = request_token(account, "")
+    return token
+
+
+def graph_token_for(account):
+    for scope in GRAPH_SCOPES:
+        token, _fatal = request_token(account, scope)
+        if token:
+            return token
     return ""
+
+
+def graph_get(token, path, params=None, search=False):
+    headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
+    if search:
+        headers["ConsistencyLevel"] = "eventual"
+    try:
+        response = HTTP.get(GRAPH_ROOT + path, headers=headers, params=params, timeout=25)
+    except requests.RequestException:
+        return None
+    if response.status_code == 401:
+        return None
+    if response.status_code != 200:
+        return {}
+    try:
+        return response.json()
+    except ValueError:
+        return {}
+
+
+def graph_list(token, folder, top, full):
+    params = {
+        "$top": str(top),
+        "$select": GRAPH_SELECT if full else GRAPH_PREVIEW,
+        "$orderby": "receivedDateTime desc",
+    }
+    path = f"/me/mailFolders/{folder}/messages"
+    data = graph_get(token, path, params)
+    if data is None:
+        return None
+    if "value" not in data:
+        params.pop("$orderby")
+        data = graph_get(token, path, params)
+        if data is None:
+            return None
+    return data.get("value") or []
+
+
+def graph_search_notion(token):
+    data = graph_get(
+        token,
+        "/me/messages",
+        {"$search": '"notion"', "$top": "20", "$select": GRAPH_SELECT, "$count": "true"},
+        search=True,
+    )
+    if not data:
+        return []
+    return data.get("value") or []
+
+
+def graph_one(token, message_id):
+    data = graph_get(
+        token,
+        f"/me/messages/{quote(str(message_id), safe='')}",
+        {"$select": GRAPH_SELECT},
+    )
+    if not data or not data.get("id"):
+        return None
+    return data
+
+
+def graph_messages(token, limit):
+    inbox_folder = graph_get(token, "/me/mailFolders/inbox", {"$select": "id"})
+    if inbox_folder is None:
+        return None
+    inbox_id = inbox_folder.get("id")
+    junk_id = (graph_get(token, "/me/mailFolders/junkemail", {"$select": "id"}) or {}).get("id")
+    archive_id = (graph_get(token, "/me/mailFolders/archive", {"$select": "id"}) or {}).get("id")
+    inbox_items = graph_list(token, "inbox", limit, True)
+    if inbox_items is None:
+        return None
+    junk_items = graph_list(token, "junkemail", limit, True) or []
+    extras = []
+    if archive_id:
+        extras.extend(graph_list(token, "archive", 40, False) or [])
+    other = 0
+    for folder in (graph_get(token, "/me/mailFolders", {"$top": "40", "$select": "id,displayName"}) or {}).get("value") or []:
+        folder_id = folder.get("id")
+        if not folder_id or folder_id in {inbox_id, junk_id, archive_id}:
+            continue
+        role = folder_role(folder.get("displayName") or "", False)
+        if role == "skip":
+            continue
+        if role != "keep":
+            if other >= 4:
+                continue
+            other += 1
+        extras.extend(graph_list(token, quote(folder_id, safe=""), 30, False) or [])
+    inbox_out = []
+    spam_out = []
+    seen = set()
+
+    def add(item, spam):
+        if not item:
+            return
+        if not (item.get("body") or {}).get("content") and looks_notion(item) and item.get("id"):
+            item = graph_one(token, item["id"]) or item
+        key = (item.get("internetMessageId") or item.get("id") or "").strip()
+        if not key or key in seen:
+            return
+        seen.add(key)
+        message = present_graph_message(item)
+        in_junk = bool(junk_id and item.get("parentFolderId") == junk_id)
+        if spam or in_junk:
+            spam_out.append(message)
+        else:
+            inbox_out.append(message)
+
+    for item in inbox_items:
+        add(item, False)
+    for item in junk_items:
+        add(item, True)
+    for item in graph_search_notion(token):
+        add(item, False)
+    for item in extras:
+        if looks_notion(item):
+            add(item, False)
+    return dedupe_messages(inbox_out), dedupe_messages(spam_out)
 
 
 def outlook_messages(account, limit):
     token = access_token_for(account)
-    if not token:
-        return [], []
+    if token:
+        loaded = imap_messages(account, token, limit)
+        if loaded is not None:
+            return loaded
+    graph = graph_token_for(account)
+    if graph:
+        try:
+            loaded = graph_messages(graph, limit)
+        except Exception:
+            loaded = None
+        if loaded is not None:
+            return loaded
+    return [], []
+
+
+def imap_messages(account, token, limit):
     auth = f"user={account['email']}\x01auth=Bearer {token}\x01\x01".encode()
     for host in OUTLOOK_HOSTS:
         imap = None
@@ -924,7 +1134,7 @@ def outlook_messages(account, limit):
             continue
         finally:
             close_imap(imap)
-    return [], []
+    return None
 
 
 def recovery_messages(account, limit):
