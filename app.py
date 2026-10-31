@@ -4,6 +4,7 @@ import base64
 import email
 import imaplib
 import os
+import poplib
 import re
 import time
 from datetime import datetime, timedelta, timezone
@@ -20,7 +21,7 @@ app = Flask(__name__)
 TEXT = {
     "ru": {
         "title": "Почта",
-        "note": "Одна строка на ящик: email:password:recovery email:recovery password:refresh token:client id. Outlook и recovery открываются сами. Код копируется кнопкой.",
+        "note": "С recovery: email:password:recovery email:recovery password:refresh token:client id. Без recovery: email:password:refresh token:client id. Код копируется кнопкой.",
         "placeholder": "вставьте строки аккаунтов",
         "open": "Открыть",
         "opening": "Открываем",
@@ -40,7 +41,7 @@ TEXT = {
     },
     "en": {
         "title": "Mail",
-        "note": "One line per mailbox: email:password:recovery email:recovery password:refresh token:client id. Outlook and recovery open together. Copy a code with the button.",
+        "note": "With recovery: email:password:recovery email:recovery password:refresh token:client id. Without recovery: email:password:refresh token:client id. Copy a code with the button.",
         "placeholder": "paste account lines",
         "open": "Open",
         "opening": "Opening",
@@ -69,6 +70,8 @@ def ui_lang():
     return lang if lang in TEXT else "ru"
 
 TOKEN_URL = "https://login.microsoftonline.com/common/oauth2/v2.0/token"
+LIVE_TOKEN_URL = "https://login.live.com/oauth20_token.srf"
+LIVE_SCOPES = ("", "wl.imap wl.offline_access", "wl.offline_access")
 OUTLOOK_IMAP = "outlook.office365.com"
 FIRSTMAIL_IMAP = "imap.firstmail.ltd"
 IMAP_SCOPES = (
@@ -384,11 +387,16 @@ document.querySelectorAll("button.lang").forEach(function (button) {
 """
 
 
+def is_live_token(value):
+    token = value or ""
+    return token.startswith("M.") or "MsaArtifacts" in token
+
+
 def parse_account(line):
     parts = [part.strip() for part in line.strip().split(":")]
-    if len(parts) < 6 or not parts[0] or not parts[-1] or not parts[-2]:
+    if len(parts) < 4 or "@" not in parts[0] or not parts[-1] or not parts[-2]:
         raise ValueError(
-            "Нужен формат email:password:recovery email:recovery password:refresh token:client id"
+            "Нужен формат email:password:refresh token:client id или строка с recovery email"
         )
     email_addr = parts[0]
     client_id = parts[-1]
@@ -396,7 +404,18 @@ def parse_account(line):
     middle = parts[1:-2]
     recovery_at = next((i for i, part in enumerate(middle) if "@" in part), None)
     if recovery_at is None:
-        raise ValueError("В строке нет recovery email")
+        password = ":".join(middle)
+        if not password or not refresh_token:
+            raise ValueError("Пустой пароль или refresh token")
+        return {
+            "email": email_addr,
+            "password": password,
+            "recovery_email": "",
+            "recovery_password": "",
+            "refresh_token": refresh_token,
+            "client_id": client_id,
+            "live": True,
+        }
     password = ":".join(middle[:recovery_at])
     recovery_email = middle[recovery_at]
     recovery_password = ":".join(middle[recovery_at + 1 :])
@@ -409,6 +428,7 @@ def parse_account(line):
         "recovery_password": recovery_password,
         "refresh_token": refresh_token,
         "client_id": client_id,
+        "live": is_live_token(refresh_token),
     }
 
 
@@ -912,7 +932,7 @@ def read_inbox(imap, limit):
     return read_recent(imap, "INBOX", limit)
 
 
-def request_token(account, scope):
+def request_token(account, scope, url=TOKEN_URL):
     data = {
         "client_id": account["client_id"],
         "refresh_token": account["refresh_token"],
@@ -922,7 +942,7 @@ def request_token(account, scope):
         data["scope"] = scope
     for attempt in range(2):
         try:
-            response = HTTP.post(TOKEN_URL, data=data, timeout=25)
+            response = HTTP.post(url, data=data, timeout=25)
         except requests.RequestException:
             time.sleep(0.4)
             continue
@@ -948,6 +968,38 @@ def access_token_for(account):
             return ""
     token, _fatal = request_token(account, "")
     return token
+
+
+def live_token_for(account):
+    for scope in LIVE_SCOPES:
+        token, _fatal = request_token(account, scope, LIVE_TOKEN_URL)
+        if token:
+            return token
+    return ""
+
+
+def pop_messages(email_addr, token, limit):
+    server = poplib.POP3_SSL("outlook.office365.com", 995, timeout=25)
+    try:
+        auth = base64.b64encode(
+            f"user={email_addr}\x01auth=Bearer {token}\x01\x01".encode()
+        ).decode()
+        server._shortcmd("AUTH XOAUTH2")
+        server._shortcmd(auth)
+        _response, items, _octets = server.list()
+        count = len(items or [])
+        start = max(1, count - limit + 1)
+        messages = []
+        for number in range(count, start - 1, -1):
+            _resp, lines, _size = server.retr(number)
+            raw = b"\n".join(lines)
+            messages.append(present_message(email.message_from_bytes(raw)))
+        return messages
+    finally:
+        try:
+            server.quit()
+        except Exception:
+            pass
 
 
 def graph_token_for(account):
@@ -1077,6 +1129,16 @@ def graph_messages(token, limit):
 
 
 def outlook_messages(account, limit):
+    if account.get("live"):
+        live_token = live_token_for(account)
+        if live_token:
+            loaded = imap_messages(account, live_token, limit)
+            if loaded is not None:
+                return loaded
+            try:
+                return pop_messages(account["email"], live_token, limit), []
+            except Exception:
+                pass
     token = access_token_for(account)
     if token:
         loaded = imap_messages(account, token, limit)
@@ -1181,10 +1243,11 @@ def check_account(account):
         spam = stamp(spam, "spam")
     except Exception:
         inbox, spam = [], []
-    try:
-        recovery = stamp(recovery_messages(account, 8), "recovery")
-    except Exception:
-        recovery = []
+    if account.get("recovery_email"):
+        try:
+            recovery = stamp(recovery_messages(account, 8), "recovery")
+        except Exception:
+            recovery = []
     messages = dedupe_messages(inbox + spam + recovery)
     notion = by_date([item for item in messages if item.get("notion")])
     rest = by_date([item for item in messages if not item.get("notion")])
